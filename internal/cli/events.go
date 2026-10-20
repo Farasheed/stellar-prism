@@ -36,6 +36,8 @@ type streamFlags struct {
 	batchTimeout     time.Duration
 	gapStrategy      string
 	maxGapRecoveries int
+	quiet            bool
+	verbosity        int
 
 	output         string
 	rotateSize     int64
@@ -75,6 +77,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		`what to do when retention pruned records: "fail" (exit 2) or "resume" from the oldest retained ledger`)
 	cmd.Flags().IntVar(&s.maxGapRecoveries, "max-gap-recoveries", 0,
 		"limit how many times --gap-strategy resume may skip ahead (0 means no limit)")
+	cmd.Flags().BoolVar(&s.quiet, "quiet", false,
+		"suppress diagnostic output on stderr; only emit final exit code")
 	cmd.Flags().StringVar(&s.output, "output-file", "",
 		"append records to this file instead of stdout")
 	cmd.Flags().Int64Var(&s.rotateSize, "rotate-size", 0,
