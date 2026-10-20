@@ -36,6 +36,12 @@ type streamFlags struct {
 	batchTimeout     time.Duration
 	gapStrategy      string
 	maxGapRecoveries int
+
+	output         string
+	rotateSize     int64
+	rotateInterval time.Duration
+	rotateCompress bool
+	rotateKeep     int
 }
 
 func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
@@ -69,6 +75,16 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		`what to do when retention pruned records: "fail" (exit 2) or "resume" from the oldest retained ledger`)
 	cmd.Flags().IntVar(&s.maxGapRecoveries, "max-gap-recoveries", 0,
 		"limit how many times --gap-strategy resume may skip ahead (0 means no limit)")
+	cmd.Flags().StringVar(&s.output, "output-file", "",
+		"append records to this file instead of stdout")
+	cmd.Flags().Int64Var(&s.rotateSize, "rotate-size", 0,
+		"rotate the output file before a write would exceed this many bytes (0 disables)")
+	cmd.Flags().DurationVar(&s.rotateInterval, "rotate-interval", 0,
+		"rotate the output file after this long (0 disables)")
+	cmd.Flags().BoolVar(&s.rotateCompress, "rotate-compress", false,
+		"gzip rotated output files")
+	cmd.Flags().IntVar(&s.rotateKeep, "rotate-keep", 0,
+		"keep at most this many rotated files (0 keeps all)")
 }
 
 func (s *streamFlags) validate() error {
@@ -89,25 +105,52 @@ func (s *streamFlags) validate() error {
 			return fmt.Errorf("batching needs --batch-size or --batch-timeout above zero")
 		}
 	}
+	if s.output == "" {
+		if s.rotateSize != 0 || s.rotateInterval != 0 || s.rotateCompress || s.rotateKeep != 0 {
+			return fmt.Errorf("--rotate-* flags require --output-file")
+		}
+	}
 	return nil
 }
 
 // newSink builds the output sink implied by the flags.
-func (s *streamFlags) newSink(w io.Writer, colorMode string, onBatchError func(error)) stream.Sink {
-	var out stream.Sink
-	if s.asJSON {
-		out = sink.NewNDJSON(w, !s.raw)
-	} else {
-		out = sink.NewHuman(w, lensformat.PaletteFor(w, colorMode), s.compact || s.raw)
+//
+// With --output-file the chosen format is built on top of a rotating writer,
+// so every streaming command supports rotation without its own plumbing. When
+// --batch is set the result is wrapped in a batcher that flushes into the
+// underlying sink, so rotation still sees whole batches.
+func (s *streamFlags) newSink(w io.Writer, colorMode string, onBatchError func(error)) (stream.Sink, error) {
+	build := func(out io.Writer) stream.Sink {
+		if s.asJSON {
+			return sink.NewNDJSON(out, !s.raw)
+		}
+		return sink.NewHuman(out, lensformat.PaletteFor(out, colorMode), s.compact || s.raw)
 	}
+
+	var out stream.Sink
+	if s.output == "" {
+		out = build(w)
+	} else {
+		rotator, err := sink.NewFileRotator(s.output, build, sink.RotatorOptions{
+			MaxSize:    s.rotateSize,
+			MaxAge:     s.rotateInterval,
+			MaxBackups: s.rotateKeep,
+			Compress:   s.rotateCompress,
+		})
+		if err != nil {
+			return nil, err
+		}
+		out = rotator
+	}
+
 	if !s.batch {
-		return out
+		return out, nil
 	}
 	return stream.NewBatcher(out, stream.BatcherOptions{
 		MaxRecords: s.batchSize,
 		MaxDelay:   s.batchTimeout,
 		OnError:    onBatchError,
-	})
+	}), nil
 }
 
 // options builds the tailer options implied by the flags.
@@ -185,7 +228,11 @@ reports the missed ledger range and exits 2 rather than skipping silently.`,
 				return err
 			}
 
-			client := newClient(rpc.ResolveURL(g.rpcURL), g.timeout)
+			client, closeClient, err := openClient(g, stderr)
+			if err != nil {
+				return err
+			}
+			defer closeClient()
 
 			from := sf.from
 			if from == 0 {
@@ -244,7 +291,11 @@ for liveness rather than reading contents.`,
 				return err
 			}
 
-			client := newClient(rpc.ResolveURL(g.rpcURL), g.timeout)
+			client, closeClient, err := openClient(g, stderr)
+			if err != nil {
+				return err
+			}
+			defer closeClient()
 
 			from := sf.from
 			if from == 0 {
@@ -294,9 +345,12 @@ func runStream(
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	out := sf.newSink(stdout, g.color, func(err error) {
+	out, err := sf.newSink(stdout, g.color, func(err error) {
 		fmt.Fprintf(stderr, "prism: batch flush failed: %v\n", err)
 	})
+	if err != nil {
+		return err
+	}
 	if closer, ok := out.(io.Closer); ok {
 		defer func() {
 			closeErr := closer.Close()
