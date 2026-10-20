@@ -42,6 +42,18 @@ type Options struct {
 	// means retry indefinitely, which is usually what a long-running tail
 	// wants.
 	MaxRetries int
+	// Adaptive switches the follow loop's poll wait to the adaptive poller in
+	// backoff.go, which tunes the interval from how many new ledgers close
+	// during each wait instead of holding PollInterval fixed. With it on,
+	// PollInterval is not consulted; the bounds below are.
+	Adaptive bool
+	// AdaptiveMin and AdaptiveMax bound the tuned interval. Zero values fall
+	// back to DefaultAdaptiveMinPoll and DefaultAdaptiveMaxPoll, and a Max
+	// below Min is pulled back up, so out-of-range configuration degrades to
+	// clamping rather than failing the stream mid-flight.
+	AdaptiveMin time.Duration
+	// AdaptiveMax is the longest interval the poller may take.
+	AdaptiveMax time.Duration
 	// Clock is injectable for tests. Defaults to RealClock.
 	Clock Clock
 	// OnRetry, when set, is called before each backoff wait so the CLI can
@@ -84,6 +96,13 @@ type Tailer struct {
 	lastID string
 
 	stats Stats
+
+	// adaptive is non-nil only when Options.Adaptive is set, and then drives
+	// the wait between polls instead of the fixed interval.
+	adaptive *AdaptivePoller
+	// latestSeen tracks the head the previous poll reported, so the adaptive
+	// poller can count how many ledgers closed during each wait.
+	latestSeen uint32
 }
 
 // NewTailer returns a Tailer wired to src and sink.
@@ -97,7 +116,42 @@ func NewTailer(src Source, sink Sink, opts Options) *Tailer {
 	if opts.Backoff.Initial == 0 && opts.Backoff.Max == 0 {
 		opts.Backoff = DefaultBackoff()
 	}
-	return &Tailer{src: src, sink: sink, opts: opts}
+	t := &Tailer{src: src, sink: sink, opts: opts}
+	if opts.Adaptive {
+		t.adaptive = NewAdaptivePoller(opts.AdaptiveMin, opts.AdaptiveMax, 2)
+	}
+	return t
+}
+
+// wait returns how long to hold before the next poll, given what the last
+// batch reported. The fixed interval is the default; the adaptive poller
+// replaces it by observing how many new ledgers closed during the previous
+// wait.
+func (t *Tailer) wait(b Batch) time.Duration {
+	if t.adaptive == nil {
+		return t.opts.PollInterval
+	}
+	return t.adaptive.Observe(t.newLedgers(b))
+}
+
+// newLedgers reports how many ledgers closed since the previous poll, or
+// zero when the head did not advance or was reported out of order by a
+// lagging backend, which is both indistinguishable from idle for tuning
+// purposes and safe to treat as such.
+func (t *Tailer) newLedgers(b Batch) int {
+	if b.Latest == 0 || t.latestSeen == 0 || b.Latest <= t.latestSeen {
+		t.latestSeen = b.Latest
+		return 0
+	}
+	n := int64(b.Latest) - int64(t.latestSeen)
+	t.latestSeen = b.Latest
+	// The delta is only consumed against thresholds, so saturate at int32 to
+	// stay portable without losing the decision.
+	const int32Max = int64(1)<<31 - 1
+	if n > int32Max {
+		n = int32Max
+	}
+	return int(n)
 }
 
 // Stats returns a snapshot of what the run has done so far.
@@ -162,7 +216,7 @@ func (t *Tailer) Run(ctx context.Context) error {
 			return t.finish(nil)
 		}
 
-		if err := t.opts.Clock.Sleep(ctx, t.opts.PollInterval); err != nil {
+		if err := t.opts.Clock.Sleep(ctx, t.wait(batch)); err != nil {
 			return t.finish(nil)
 		}
 	}

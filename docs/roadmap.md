@@ -11,7 +11,11 @@ Working and tested:
 - `prism tx` — fetch and explain, through the lens explain path
 - NDJSON on everything, flushed per record
 - `--from` backfill, draining full pages at network speed
+- `--since 10m` — relative windows converted to approximate start ledgers
 - Reconnection with jittered backoff; retry never advances the cursor
+- `--adaptive` — poll waits tuned from observed ledger close frequency
+- Client-side `--topic-pattern` — glob, prefix and regex over decoded topics
+- `--fanout-dir` — one NDJSON file per contract via the streaming demux
 - Gap detection against the server's retention window, exiting 2
 - Streaming core fully tested with no network, and mutation-checked
 
@@ -58,9 +62,9 @@ sinks are unchanged. A good first substantial contribution.
 
 ### Better `--follow` ergonomics
 
-- `--since 10m` as an alternative to `--from <ledger>`
 - a heartbeat line on stderr when a follow is idle, so a quiet contract is
-  distinguishable from a hung process
+  distinguishable from a hung process (the `--since` half of this list has
+  already shipped — see it in the working list above)
 - `--stats` on exit, reporting records emitted, duplicates suppressed and
   retries
 

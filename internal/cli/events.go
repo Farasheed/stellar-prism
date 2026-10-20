@@ -23,6 +23,7 @@ import (
 type streamFlags struct {
 	follow   bool
 	from     uint32
+	since    time.Duration
 	limit    int
 	asJSON   bool
 	raw      bool
@@ -30,6 +31,11 @@ type streamFlags struct {
 	poll     time.Duration
 	pageSize uint
 	retries  int
+	adaptive bool
+	// topicPatterns and fanoutDir are events-only; the other commands leave
+	// them empty, which is what keeps runStream generic.
+	topicPatterns []string
+	fanoutDir     string
 }
 
 func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
@@ -37,6 +43,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"keep streaming as new ledgers close, like tail -f")
 	cmd.Flags().Uint32Var(&s.from, "from", 0,
 		"start from this ledger and continue forward (default: the latest ledger)")
+	cmd.Flags().DurationVar(&s.since, "since", 0,
+		"start about this long ago, e.g. --since 10m; converted to an approximate start ledger (mutually exclusive with --from)")
 	cmd.Flags().IntVarP(&s.limit, "limit", "n", 0,
 		"stop after this many records (0 means unlimited)")
 	cmd.Flags().BoolVar(&s.asJSON, "json", false,
@@ -51,6 +59,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"how many records to request per RPC call")
 	cmd.Flags().IntVar(&s.retries, "max-retries", 0,
 		"give up after this many consecutive RPC failures (0 means never give up)")
+	cmd.Flags().BoolVar(&s.adaptive, "adaptive", false,
+		"tune the wait between polls from how many new ledgers close each interval (with --follow)")
 }
 
 // newSink builds the output sink implied by the flags.
@@ -68,6 +78,9 @@ func (s *streamFlags) options(stderr io.Writer, quiet bool) stream.Options {
 		Limit:        s.limit,
 		PollInterval: s.poll,
 		MaxRetries:   s.retries,
+		Adaptive:     s.adaptive,
+		// Bounds stay zero so the tailer fills the documented defaults in;
+		// the CLI keeps its flag surface to one switch.
 		OnRetry: func(attempt int, delay time.Duration, err error) {
 			if quiet {
 				return
@@ -79,6 +92,36 @@ func (s *streamFlags) options(stderr io.Writer, quiet bool) stream.Options {
 				err, delay.Round(time.Millisecond), attempt)
 		},
 	}
+}
+
+// resolveStart applies the --from/--since policy shared by the streaming
+// commands. --since converts a relative window into an approximate start
+// ledger against the server's reported head, --from is passed through, and
+// omitting both starts at the head. The two are mutually exclusive, and the
+// check runs before any RPC call so a bad flag pair fails with no network.
+func (s *streamFlags) resolveStart(cmd *cobra.Command, client rpc.Client, stderr io.Writer) (uint32, error) {
+	if cmd.Flags().Changed("since") {
+		if s.from != 0 {
+			return 0, fmt.Errorf("--from and --since are mutually exclusive; pass only one")
+		}
+		if s.since < 0 {
+			return 0, fmt.Errorf("--since must not be negative")
+		}
+		latest, err := latestLedger(cmd.Context(), client)
+		if err != nil {
+			return 0, err
+		}
+		start := stream.StartLedgerForWindow(latest, s.since)
+		// The resolution is informational and approximate by design, so say
+		// so on stderr, where it never contaminates a piped --json stream.
+		fmt.Fprintf(stderr, "prism: --since %s resolves to start ledger %d (head %d, assuming a %s ledger cadence)\n",
+			s.since, start, latest, stream.RoughLedgerCloseInterval)
+		return start, nil
+	}
+	if s.from != 0 {
+		return s.from, nil
+	}
+	return latestLedger(cmd.Context(), client)
 }
 
 func newEventsCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
@@ -120,15 +163,9 @@ reports the missed ledger range and exits 2 rather than skipping silently.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			client := newClient(rpc.ResolveURL(g.rpcURL), g.timeout)
 
-			from := sf.from
-			if from == 0 {
-				// Starting "now" means asking the server where now is; the
-				// RPC requires a concrete start ledger.
-				latest, err := latestLedger(cmd.Context(), client)
-				if err != nil {
-					return err
-				}
-				from = latest
+			from, err := sf.resolveStart(cmd, client, stderr)
+			if err != nil {
+				return err
 			}
 
 			src, err := stream.NewEventSource(client, stream.EventQuery{
@@ -155,6 +192,12 @@ reports the missed ledger range and exits 2 rather than skipping silently.`,
 		`topic filter as comma-separated base64 ScVals, with "*" and "**" wildcards; repeatable, up to 5`)
 	cmd.Flags().StringSliceVar(&eventTypes, "type", nil,
 		"event type to include: contract, system or diagnostic (default: all)")
+	// StringArray, not StringSlice: a comma separates segment *patterns*
+	// within one filter, which StringSlice's comma-splitting would destroy.
+	cmd.Flags().StringArrayVar(&sf.topicPatterns, "topic-pattern", nil,
+		`client-side topic pattern as comma-separated segments over decoded topics: "*", "**", "prefix:TEXT", "re:REGEX", or plain text with "*" and "?" globs; repeatable, up to 5`)
+	cmd.Flags().StringVar(&sf.fanoutDir, "fanout-dir", "",
+		"write each watched contract's events to its own NDJSON file in this directory, in addition to the main output")
 	sf.register(cmd, stream.DefaultPageLimit)
 
 	return cmd
@@ -176,13 +219,9 @@ for liveness rather than reading contents.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			client := newClient(rpc.ResolveURL(g.rpcURL), g.timeout)
 
-			from := sf.from
-			if from == 0 {
-				latest, err := latestLedger(cmd.Context(), client)
-				if err != nil {
-					return err
-				}
-				from = latest
+			from, err := sf.resolveStart(cmd, client, stderr)
+			if err != nil {
+				return err
 			}
 
 			src := stream.NewLedgerSource(client, stream.LedgerQuery{
@@ -215,9 +254,37 @@ func runStream(
 	defer stop()
 
 	out := sf.newSink(stdout, g.color)
+	if len(sf.topicPatterns) > 0 {
+		patterns, err := stream.CompileTopicPatterns(sf.topicPatterns)
+		if err != nil {
+			return err
+		}
+		out = stream.NewPatternSink(out, patterns)
+	}
+
+	// The fanout shares this tailer's records: the demux inside writes one
+	// NDJSON file per contract while stdout keeps the combined stream.
+	var fan *fanoutSink
+	if sf.fanoutDir != "" {
+		f, err := newFanoutSink(sf.fanoutDir)
+		if err != nil {
+			return err
+		}
+		fan = f
+		out = &teeSink{main: out, second: fan}
+	}
+
 	tailer := stream.NewTailer(src, out, sf.options(stderr, sf.asJSON && stderr == nil))
 
 	err := tailer.Run(ctx)
+	if fan != nil {
+		// Wind the demux down whatever happened above: it drains, flushes and
+		// closes every per-contract file, and joins any sink error with err
+		// so a fanout failure still fails the command.
+		if fanErr := fan.finish(); fanErr != nil {
+			err = errors.Join(err, fanErr)
+		}
+	}
 
 	var gap *stream.GapError
 	if errors.As(err, &gap) {

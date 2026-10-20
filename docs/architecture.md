@@ -48,6 +48,10 @@ pkg/stream/
   events.go           contract events source
   ledgers.go          ledger close source
   clock.go            Clock and Backoff, both injectable
+  topic_pattern.go    client-side topic matching over decoded text
+  demux.go            per-contract fan-out, queues + one goroutine each
+  time_window.go      --since → approximate start ledger
+  backoff.go          AdaptivePoller for --adaptive follow waits
 pkg/sink/
   ndjson.go           NDJSON, one object per line
   human.go            terminal output, payloads via lens
@@ -128,6 +132,55 @@ blocks the write, which blocks the poll loop. That is correct backpressure
 with no queue to grow. It is also why both sinks flush per record: a tail that
 buffers looks like a tail that has hung.
 
+### --since: relative windows, offline and approximate
+
+`--since 10m` converts a relative window into a start ledger by dividing the
+window by `RoughLedgerCloseInterval` (5s, in `time_window.go`) and rounding
+**up**, so a window never starts *later* than asked. The conversion is pure
+arithmetic on the server's reported head: one RPC call (`getLatestLedger`, the
+same one a run with no `--from` makes anyway), no second call to measure the
+real cadence. The ledger rate varies with network load, so the result is
+approximate by design — streams needing an exact ledger use `--from`. Very
+long windows clamp to ledger 1, where the server's own retention error takes
+over.
+
+### Client-side topic patterns
+
+The server-side `--topic` filters are constrained to base64 ScVal segments
+with `*`/`**` wildcards, because that is all the RPC understands. `--topic-pattern`
+adds glob, prefix and regular-expression matching over the **decoded** topic
+text, applied client-side in `topic_pattern.go` by a `PatternSink` that wraps
+the output sink. The text it matches against is derived from the same lens
+envelope `--json` prints, so a pattern tuned against `--json` output works
+unchanged here — and filtering lives at the sink seam rather than inside the
+tailer, so the delivery guarantee and cursor mechanics are untouched by
+output shaping.
+
+### Per-contract fan-out
+
+`--fanout-dir` routes one stream to one NDJSON file per contract while the
+terminal keeps the combined output. The routing lives in `stream.Demux`
+(demux.go): an intake queue, a single dispatcher goroutine, and one queue plus
+goroutine per subscribed contract. Records are routed by `Event.ContractID`;
+each subscriber's queue holds a small buffer and overflows by counting drops
+rather than wedging the other contracts. `Close` after the tailer stops
+drains everything the caller accepted, closes each queue from the dispatcher
+—the only closer, after its last send — flushes, and waits on every goroutine,
+so a fanout run terminates with no leaked goroutines and a joined error.
+
+### Adaptive polling
+
+`--adaptive` replaces the fixed `--poll` wait with an `AdaptivePoller`
+(backoff.go) whose only signal is how many new ledgers closed during the last
+wait: at least one means the wait matched or beat the ledger cadence, so
+shorten; zero means mostly dead time, so lengthen. With no cadence parameter
+at all that rule converges on oscillating around the real close rate, tracking
+a network it is never told about — and the stretchy bounds (`--min-poll`-less
+defaults 1s..30s) keep the invariant: never faster than Min, never slower
+than Max. Jitter spreads each returned wait over its lower half so several
+prism instances do not poll in phase. The tuner is one number in one
+goroutine, so its tests run deterministically — no wall-clock flakiness.
+
 ### What is deliberately *not* handled
 
 **Chain reorganisations.** Stellar ledgers are final on close — SCP gives
@@ -154,7 +207,10 @@ Every scenario funnels through one helper asserting three invariants:
 Covered: clean streams, drops at every position, consecutive drops, replayed
 pages, out-of-order pages, retention overrun, lagging backends, permanent
 errors, retry exhaustion, cancellation mid-follow, sink failure, and
-full-page draining.
+full-page draining — plus the same guarantees through the seams this file
+describes below: adaptive poll waits, `--since` window arithmetic, client-
+side topic patterns, and demux routing under concurrent submitters (all
+race-detector checked via `go test -race`).
 
 Time is injected via `Clock`, so there are no real sleeps and no wall-clock
 flakiness. Follow-loop tests carry a sleep budget that cancels the context, so
