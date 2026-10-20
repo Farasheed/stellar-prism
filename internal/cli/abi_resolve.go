@@ -42,7 +42,7 @@ type contractSpec struct {
 }
 
 // newABICmd builds `prism abi <contract-id>`.
-func newABICmd(g *globalFlags, stdout io.Writer) *cobra.Command {
+func newABICmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 	var (
 		function  string
 		arguments []string
@@ -75,7 +75,12 @@ hand.`,
 				return fmt.Errorf("--arg requires --function")
 			}
 
-			client := newClient(prismrpc.ResolveURL(g.rpcURL), g.timeout)
+			client, closeClient, err := openClient(g, stderr)
+			if err != nil {
+				return err
+			}
+			defer closeClient()
+
 			spec, err := resolveContractSpec(cmd.Context(), client, args[0])
 			if err != nil {
 				return err

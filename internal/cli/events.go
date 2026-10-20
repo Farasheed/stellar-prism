@@ -12,6 +12,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	lensformat "github.com/stellar-optics/stellar-xdr-lens/pkg/lens/format"
+
 	"github.com/stellar-optics/stellar-prism/pkg/rpc"
 	"github.com/stellar-optics/stellar-prism/pkg/sink"
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
