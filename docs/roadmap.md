@@ -9,6 +9,9 @@ Working and tested:
 - `prism events` — contract, topic and type filters; one-shot or `--follow`
 - `prism ledgers` — ledger close metadata
 - `prism tx` — fetch and explain, through the lens explain path
+- `prism abi` — resolve a contract's WASM via RPC and render its embedded spec
+- `prism completion` and `prism gendocs` — shell completion and reference docs
+- `--color auto|always|never` honoring `NO_COLOR`
 - NDJSON on everything, flushed per record or per `--batch`
 - `--from` backfill, draining full pages at network speed, optionally with
   `--backfill-workers`
@@ -19,9 +22,10 @@ Working and tested:
 
 Known limits, stated plainly:
 
-- **No contract-spec decoding.** Payloads render as the XDR wire shape.
-  `stellar events` decodes against the contract's spec and is better for
-  reading values today. See below.
+- **Event payloads still render as the XDR wire shape.** `prism abi` can
+  resolve and display the spec, including decoding standalone `--arg` values,
+  but the live event stream does not yet apply struct/field names
+  automatically. See below.
 - **No durable cursor.** Exactly-once across restarts is not offered; a
   process killed between emitting and advancing will re-emit on restart.
 - **Polling, not push.** Soroban RPC has no subscription API, so latency is

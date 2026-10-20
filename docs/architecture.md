@@ -38,9 +38,13 @@ synchronously, advances the cursor, and repeats. Concurrency would buy nothing
 
 ```
 cmd/prism/            main; maps errors to exit codes
+  gendocs.go          man page and Markdown generator
 internal/cli/         cobra commands — thin wrappers over pkg/stream
+  color.go            --color parsing and NO_COLOR handling
+  completion.go       bash/zsh/fish/powershell script generation
+  abi_resolve.go      contract WASM lookup and embedded-spec parsing
 internal/fakerpc/     scriptable in-memory RPC for tests
-pkg/rpc/              the four-method Client interface + SDK adapter
+pkg/rpc/              the Client interface + SDK adapter
 pkg/stream/
   record.go           Record: the neutral item every source produces
   source.go           Source and Sink interfaces, GapError   ← the seams
@@ -242,6 +246,50 @@ prism does **no XDR decoding of its own**. Every payload goes through
 
 Shared CLI conventions: `--json`, `--color auto|always|never`, and the same
 exit-code meanings.
+
+## Colour control
+
+`--color` accepts exactly `auto`, `always` and `never`, and an invalid value is
+rejected before any command runs. `auto` colours only when the destination is a
+terminal, `TERM` is not `dumb`, and `NO_COLOR` is unset, following
+[no-color.org](https://no-color.org). `always` is an explicit operator request
+and therefore overrides `NO_COLOR`; `never` always wins in the other direction.
+The palette itself comes from lens, so prism and lens colour values identically.
+
+## Contract ABI resolution
+
+`prism abi <contract-id>` resolves a contract's spec without trusting a local
+file. The flow is two `getLedgerEntries` calls:
+
+1. The contract's persistent instance entry names its `ContractExecutable`.
+   For user contracts that is a WASM hash; the Stellar asset contract has no
+   embedded spec and is reported as such.
+2. The contract-code entry for that hash carries the WASM bytecode.
+
+The bytecode's `contractspecv0` custom section is a concatenated stream of
+`ScSpecEntry` XDR values. `abi_resolve.go` walks the WASM section framing,
+decodes each entry with the XDR stream decoder, and groups functions, structs,
+unions, enums, error enums and events. Function parameters and return types are
+rendered in Soroban type syntax, and `--function` plus repeated `--arg` decodes
+actual base64 `ScVal` values through lens against the named parameters.
+
+`getLedgerEntries` is an optional capability (`rpc.LedgerEntriesClient`), not
+part of the streaming `rpc.Client` interface. That keeps the four-method core
+small and avoids forcing stream-only fakes to implement a method they never
+use. Only the `abi` command takes this path; every streaming command remains
+independent of it.
+
+## Completions and generated documentation
+
+`prism completion <shell>` is pure command-tree traversal, so it makes no
+network calls. Command constructors register fixed value completions for
+enumerated flags (`--color`, `--type`, `--gap-strategy`); a new enum flag should
+call `registerFlagCompletion` next to its flag definition.
+
+`prism gendocs <man|markdown>` uses Cobra's document generators. It is attached
+to the root command from package main so `internal/cli` does not depend on the
+documentation packages. The generator disables Cobra's automatic timestamp tag
+so rerunning it does not dirty version control.
 
 ## Adding a stream source
 
