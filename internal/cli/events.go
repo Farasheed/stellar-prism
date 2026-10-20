@@ -39,6 +39,8 @@ type streamFlags struct {
 	quiet            bool
 	verbosity        int
 
+	sinks sinkFlags
+
 	output         string
 	rotateSize     int64
 	rotateInterval time.Duration
@@ -89,9 +91,13 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"gzip rotated output files")
 	cmd.Flags().IntVar(&s.rotateKeep, "rotate-keep", 0,
 		"keep at most this many rotated files (0 keeps all)")
+	s.sinks.register(cmd)
 }
 
 func (s *streamFlags) validate() error {
+	if err := s.sinks.validate(); err != nil {
+		return err
+	}
 	if s.backfillWorkers < 1 {
 		return fmt.Errorf("--backfill-workers must be at least 1")
 	}
@@ -147,13 +153,23 @@ func (s *streamFlags) newSink(w io.Writer, colorMode string, onBatchError func(e
 		out = rotator
 	}
 
+	out, err := s.sinks.addTo(out, !s.raw, onBatchError)
+	if err != nil {
+		return nil, err
+	}
+
 	if !s.batch {
 		return out, nil
 	}
 	return stream.NewBatcher(out, stream.BatcherOptions{
 		MaxRecords: s.batchSize,
 		MaxDelay:   s.batchTimeout,
-		OnError:    onBatchError,
+		OnError: func(err error) {
+			if s.sinks.metrics != nil {
+				s.sinks.metrics.RecordError("sink")
+			}
+			onBatchError(err)
+		},
 	}), nil
 }
 
@@ -184,6 +200,9 @@ func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, err
 		GapStrategy:      strategy,
 		MaxGapRecoveries: s.maxGapRecoveries,
 		OnRetry: func(attempt int, delay time.Duration, err error) {
+			if s.sinks.metrics != nil {
+				s.sinks.metrics.RecordError("rpc")
+			}
 			if showAtLeast(attempt, s.verbosity) {
 				// Reconnection is reported on stderr so it never contaminates a
 				// piped NDJSON stream, and so a stalled tail explains itself
@@ -193,6 +212,9 @@ func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, err
 			}
 		},
 		OnGap: func(event stream.GapEvent) {
+			if s.sinks.metrics != nil {
+				s.sinks.metrics.RecordError("gap")
+			}
 			if showAtLeast(1, s.verbosity) && event.Recovered {
 				fmt.Fprintf(stderr,
 					"prism: %v; recovering by resuming at ledger %d\n",
@@ -368,6 +390,11 @@ func runStream(
 	})
 	if err != nil {
 		return err
+	}
+	if sf.sinks.metrics != nil {
+		if addr := sf.sinks.metrics.Addr(); addr != "" {
+			fmt.Fprintf(stderr, "prism: serving metrics on http://%s/metrics\n", addr)
+		}
 	}
 	if closer, ok := out.(io.Closer); ok {
 		defer func() {
