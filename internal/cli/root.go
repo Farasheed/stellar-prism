@@ -44,8 +44,13 @@ type globalFlags struct {
 
 // Execute builds and runs the root command, returning an error rather than
 // exiting so main keeps control of the exit code.
-func Execute(args []string, stdout, stderr io.Writer) error {
+//
+// extra commands are attached to the root before execution, which lets the
+// binary add commands whose implementation belongs in package main (such as
+// the documentation generator) without growing this package's dependencies.
+func Execute(args []string, stdout, stderr io.Writer, extra ...*cobra.Command) error {
 	root := newRootCmd(stdout, stderr)
+	root.AddCommand(extra...)
 	root.SetArgs(args)
 	return root.Execute()
 }
@@ -80,6 +85,10 @@ official ` + "`stellar events`" + ` command does that better. prism is for watch
   prism tx 3389e9f0...`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			_, err := parseColorMode(g.color)
+			return err
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return cmd.Help()
 		},
@@ -94,13 +103,16 @@ official ` + "`stellar events`" + ` command does that better. prism is for watch
 		"Soroban RPC endpoint (default $"+rpc.URLEnvVar+", else "+rpc.DefaultURL+")")
 	root.PersistentFlags().DurationVar(&g.timeout, "rpc-timeout", 30*time.Second,
 		"timeout for a single RPC call")
+	registerFlagCompletion(root, "color", string(colorAuto), string(colorAlways), string(colorNever))
 
 	root.AddCommand(
 		newEventsCmd(g, stdout, stderr),
 		newLedgersCmd(g, stdout, stderr),
 		newTransactionsCmd(g, stdout, stderr),
+		newABICmd(g, stdout),
 		newTxCmd(g, stdout),
 		newVersionCmd(stdout),
+		newCompletionCmd(stdout),
 	)
 	return root
 }

@@ -28,7 +28,7 @@ import (
 )
 
 func main() {
-	err := cli.Execute(os.Args[1:], os.Stdout, os.Stderr)
+	err := cli.Execute(os.Args[1:], os.Stdout, os.Stderr, newGendocsCmd(os.Stdout, os.Stderr))
 	code, printable := cli.ExitCode(err)
 	if printable {
 		fmt.Fprintln(os.Stderr, "prism:", err)

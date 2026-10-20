@@ -12,8 +12,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	lensformat "github.com/stellar-optics/stellar-xdr-lens/pkg/lens/format"
-
 	"github.com/stellar-optics/stellar-prism/pkg/rpc"
 	"github.com/stellar-optics/stellar-prism/pkg/sink"
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
@@ -93,12 +91,12 @@ func (s *streamFlags) validate() error {
 }
 
 // newSink builds the output sink implied by the flags.
-func (s *streamFlags) newSink(w io.Writer, colorMode string, onBatchError func(error)) stream.Sink {
+func (s *streamFlags) newSink(w io.Writer, color colorMode, onBatchError func(error)) stream.Sink {
 	var out stream.Sink
 	if s.asJSON {
 		out = sink.NewNDJSON(w, !s.raw)
 	} else {
-		out = sink.NewHuman(w, lensformat.PaletteFor(w, colorMode), s.compact || s.raw)
+		out = sink.NewHuman(w, color.palette(w), s.compact || s.raw)
 	}
 	if !s.batch {
 		return out
@@ -222,6 +220,8 @@ reports the missed ledger range and exits 2 rather than skipping silently.`,
 	cmd.Flags().StringSliceVar(&eventTypes, "type", nil,
 		"event type to include: contract, system or diagnostic (default: all)")
 	sf.register(cmd, stream.DefaultPageLimit)
+	registerFlagCompletion(cmd, "type", "contract", "system", "diagnostic")
+	registerFlagCompletion(cmd, "gap-strategy", string(stream.GapFail), string(stream.GapResume))
 
 	return cmd
 }
@@ -266,6 +266,7 @@ for liveness rather than reading contents.`,
 	}
 
 	sf.register(cmd, stream.DefaultLedgerPageLimit)
+	registerFlagCompletion(cmd, "gap-strategy", string(stream.GapFail), string(stream.GapResume))
 	return cmd
 }
 
@@ -294,7 +295,11 @@ func runStream(
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	out := sf.newSink(stdout, g.color, func(err error) {
+	color, err := parseColorMode(g.color)
+	if err != nil {
+		return err
+	}
+	out := sf.newSink(stdout, color, func(err error) {
 		fmt.Fprintf(stderr, "prism: batch flush failed: %v\n", err)
 	})
 	if closer, ok := out.(io.Closer); ok {
