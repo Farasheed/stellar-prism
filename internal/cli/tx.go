@@ -80,7 +80,7 @@ without the copy-and-paste.`,
 			}
 
 			if failOnErr && summary.Outcome != nil && !summary.Outcome.Success {
-				return &exitError{code: 2, msg: "transaction failed"}
+				return fmt.Errorf("transaction failed")
 			}
 			return nil
 		},
