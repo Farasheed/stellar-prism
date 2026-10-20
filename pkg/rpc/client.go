@@ -128,6 +128,26 @@ func (c *SDKClient) GetLedgers(ctx context.Context, req protocol.GetLedgersReque
 	return resp, nil
 }
 
+// GetLedgerEntries returns the requested ledger entries.
+//
+// It is deliberately not part of Client: the streaming core only needs the
+// four methods above, and keeping the interface small avoids forcing every
+// test double to implement a method it never uses. Callers that need it, such
+// as contract ABI resolution, assert for LedgerEntriesClient instead.
+func (c *SDKClient) GetLedgerEntries(ctx context.Context, req protocol.GetLedgerEntriesRequest) (protocol.GetLedgerEntriesResponse, error) {
+	resp, err := c.inner.GetLedgerEntries(ctx, req)
+	if err != nil {
+		return resp, fmt.Errorf("rpc getLedgerEntries: %w", err)
+	}
+	return resp, nil
+}
+
+// LedgerEntriesClient is the optional capability used to resolve contract
+// specs from on-chain WASM. SDKClient implements it.
+type LedgerEntriesClient interface {
+	GetLedgerEntries(ctx context.Context, req protocol.GetLedgerEntriesRequest) (protocol.GetLedgerEntriesResponse, error)
+}
+
 // GetTransaction implements Client.
 func (c *SDKClient) GetTransaction(ctx context.Context, req protocol.GetTransactionRequest) (protocol.GetTransactionResponse, error) {
 	resp, err := c.inner.GetTransaction(ctx, req)

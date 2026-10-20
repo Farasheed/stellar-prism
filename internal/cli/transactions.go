@@ -51,5 +51,6 @@ Transactions can be streamed continuously by using the --follow flag.`,
 	}
 
 	sf.register(cmd, stream.DefaultTransactionPageLimit)
+	registerFlagCompletion(cmd, "gap-strategy", string(stream.GapFail), string(stream.GapResume))
 	return cmd
 }

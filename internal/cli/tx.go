@@ -66,8 +66,12 @@ without the copy-and-paste.`,
 					return fmt.Errorf("encoding summary: %w", err)
 				}
 			} else {
+				color, err := parseColorMode(g.color)
+				if err != nil {
+					return err
+				}
 				f := lensformat.NewSummaryFormatter(
-					lensformat.WithSummaryPalette(lensformat.PaletteFor(stdout, g.color)),
+					lensformat.WithSummaryPalette(color.palette(stdout)),
 					lensformat.WithVerbose(verbose),
 				)
 				if err := f.Format(stdout, summary); err != nil {

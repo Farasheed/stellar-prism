@@ -284,6 +284,8 @@ reports the missed ledger range and exits 2 rather than skipping silently.`,
 	cmd.Flags().StringSliceVar(&eventTypes, "type", nil,
 		"event type to include: contract, system or diagnostic (default: all)")
 	sf.register(cmd, stream.DefaultPageLimit)
+	registerFlagCompletion(cmd, "type", "contract", "system", "diagnostic")
+	registerFlagCompletion(cmd, "gap-strategy", string(stream.GapFail), string(stream.GapResume))
 
 	return cmd
 }
@@ -332,6 +334,7 @@ for liveness rather than reading contents.`,
 	}
 
 	sf.register(cmd, stream.DefaultLedgerPageLimit)
+	registerFlagCompletion(cmd, "gap-strategy", string(stream.GapFail), string(stream.GapResume))
 	return cmd
 }
 
