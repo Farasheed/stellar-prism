@@ -169,24 +169,6 @@ func DefaultLogger() *jsonLogger {
 	return defaultLogger
 }
 
-// Shortcut methods for the default logger.
-
-func defaultDebug(message string, fields ...any) {
-	DefaultLogger().Debug(message, fields...)
-}
-
-func defaultInfo(message string, fields ...any) {
-	DefaultLogger().Info(message, fields...)
-}
-
-func defaultWarn(message string, fields ...any) {
-	DefaultLogger().Warn(message, fields...)
-}
-
-func defaultError(message string, fields ...any) {
-	DefaultLogger().Error(message, fields...)
-}
-
 // StackTraceDefault emits a goroutine stack trace via the default logger.
 func StackTraceDefault(message string) {
 	DefaultLogger().StackTrace(message)
