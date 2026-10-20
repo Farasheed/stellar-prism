@@ -9,7 +9,6 @@
 package cli
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -117,27 +116,8 @@ func newVersionCmd(stdout io.Writer) *cobra.Command {
 	}
 }
 
-// exitError carries an explicit process exit code.
-type exitError struct {
-	code int
-	msg  string
-}
-
-func (e *exitError) Error() string { return e.msg }
-
 // ExitCode maps an error to a process exit code, and reports whether it
 // should be printed.
-//
 // The meanings match lens: 0 success, 1 error, 2 a specific negative outcome
 // the caller may want to branch on. Here 2 means the stream gapped, which is
 // distinguishable from an ordinary failure so CI can treat it differently.
-func ExitCode(err error) (code int, printable bool) {
-	if err == nil {
-		return 0, false
-	}
-	var ee *exitError
-	if errors.As(err, &ee) {
-		return ee.code, false
-	}
-	return 1, true
-}

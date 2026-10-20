@@ -36,6 +36,8 @@ type streamFlags struct {
 	batchTimeout     time.Duration
 	gapStrategy      string
 	maxGapRecoveries int
+	quiet            bool
+	verbosity        int
 }
 
 func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
@@ -69,6 +71,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		`what to do when retention pruned records: "fail" (exit 2) or "resume" from the oldest retained ledger`)
 	cmd.Flags().IntVar(&s.maxGapRecoveries, "max-gap-recoveries", 0,
 		"limit how many times --gap-strategy resume may skip ahead (0 means no limit)")
+	cmd.Flags().BoolVar(&s.quiet, "quiet", false,
+		"suppress diagnostic output on stderr; only emit final exit code")
 }
 
 func (s *streamFlags) validate() error {
@@ -116,6 +120,19 @@ func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, err
 	if err != nil {
 		return stream.Options{}, err
 	}
+
+	// Determine effective quiet mode: flag overrides the quiet parameter.
+	effectiveQuiet := s.quiet || quiet
+
+	// verbosity check helper: returns true if the given level should be shown
+	// given the effective verbosity level (higher numeric = more verbose).
+	showAtLeast := func(level int, minimum int) bool {
+		if effectiveQuiet {
+			return false
+		}
+		return level >= minimum
+	}
+
 	return stream.Options{
 		Follow:           s.follow,
 		Limit:            s.limit,
@@ -124,22 +141,20 @@ func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, err
 		GapStrategy:      strategy,
 		MaxGapRecoveries: s.maxGapRecoveries,
 		OnRetry: func(attempt int, delay time.Duration, err error) {
-			if quiet {
-				return
+			if showAtLeast(attempt, s.verbosity) {
+				// Reconnection is reported on stderr so it never contaminates a
+				// piped NDJSON stream, and so a stalled tail explains itself
+				// rather than appearing to hang.
+				fmt.Fprintf(stderr, "prism: RPC call failed (%v); retrying in %s (attempt %d)\n",
+					err, delay.Round(time.Millisecond), attempt)
 			}
-			// Reconnection is reported on stderr so it never contaminates a
-			// piped NDJSON stream, and so a stalled tail explains itself
-			// rather than appearing to hang.
-			fmt.Fprintf(stderr, "prism: RPC call failed (%v); retrying in %s (attempt %d)\n",
-				err, delay.Round(time.Millisecond), attempt)
 		},
 		OnGap: func(event stream.GapEvent) {
-			if quiet || !event.Recovered {
-				return
+			if showAtLeast(1, s.verbosity) && event.Recovered {
+				fmt.Fprintf(stderr,
+					"prism: %v; recovering by resuming at ledger %d\n",
+					event.Gap, event.Gap.Oldest)
 			}
-			fmt.Fprintf(stderr,
-				"prism: %v; recovering by resuming at ledger %d\n",
-				event.Gap, event.Gap.Oldest)
 		},
 	}, nil
 }
@@ -307,15 +322,10 @@ func runStream(
 				err = closeErr
 				return
 			}
-			var ee *exitError
-			if errors.As(err, &ee) {
-				fmt.Fprintf(stderr, "prism: closing output: %v\n", closeErr)
-			}
-			err = errors.Join(err, closeErr)
 		}()
 	}
 
-	opts, err := sf.options(stderr, sf.asJSON && stderr == nil)
+	opts, err := sf.options(stderr, sf.quiet)
 	if err != nil {
 		return err
 	}
@@ -376,7 +386,7 @@ func reportStreamError(err error, stderr io.Writer) error {
 		fmt.Fprintf(stderr,
 			"prism: restart with --from %d to resume from the oldest data the server still has\n",
 			gap.Oldest)
-		return &exitError{code: 2, msg: gap.Error()}
+		return &ExitCodeError{Code: 2, Message: gap.Error()}
 	}
 	return err
 }
