@@ -79,7 +79,9 @@ type Server struct {
 	// is empty.
 	txs protocol.GetTransactionsResponse
 	// entries maps an encoded ledger key to its canned result.
-	entries map[string]protocol.LedgerEntryResult
+	entries         map[string]protocol.LedgerEntryResult
+	simulations     []protocol.SimulateTransactionResponse
+	simulationCalls int
 }
 
 // Option configures a Server.
@@ -175,6 +177,15 @@ func (s *Server) SetTransactions(resp protocol.GetTransactionsResponse) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.txs = resp
+}
+
+// SetSimulations installs responses returned in order by simulateTransaction.
+// The final response is reused after the sequence is exhausted.
+func (s *Server) SetSimulations(responses []protocol.SimulateTransactionResponse) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.simulations = append([]protocol.SimulateTransactionResponse(nil), responses...)
+	s.simulationCalls = 0
 }
 
 // SetLedgerEntries installs canned results keyed by encoded ledger key.
@@ -584,6 +595,24 @@ func (s *Server) GetLatestLedger(ctx context.Context) (protocol.GetLatestLedgerR
 		return protocol.GetLatestLedgerResponse{}, err
 	}
 	return protocol.GetLatestLedgerResponse{Sequence: s.latest}, nil
+}
+
+// SimulateTransaction implements rpc.Client.
+func (s *Server) SimulateTransaction(ctx context.Context, req protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return protocol.SimulateTransactionResponse{}, err
+	}
+	if len(s.simulations) == 0 {
+		return protocol.SimulateTransactionResponse{}, nil
+	}
+	index := s.simulationCalls
+	if index >= len(s.simulations) {
+		index = len(s.simulations) - 1
+	}
+	s.simulationCalls++
+	return s.simulations[index], nil
 }
 
 // MakeEvents builds a contiguous run of events, one per ledger starting at

@@ -59,6 +59,10 @@ pkg/stream/
   transactions.go     transaction source
   storage_changes.go  contract storage mutations (from tx meta)
   wasm_events.go      WASM uploads and contract deployments
+  operations.go        operation-level transaction demux
+  footprint.go         same-ledger Soroban footprint conflicts
+  simulate.go          live transaction simulation estimates
+  reorder.go            intra-ledger response reordering buffer
   pool.go             multi-endpoint failover RPC client
   drainer.go          concurrent historical backfill + ordered merge
   batcher.go          count/time batching sink wrapper
@@ -249,6 +253,28 @@ Both sources synthesise fixed-width zero-padded IDs (`%010d-%06d-…`) from
 the ledger sequence, preserving the lexicographic-order contract the tailer
 depends on.
 
+### Operation streams (`prism operations`)
+
+`OperationSource` decodes each transaction envelope and emits one record per
+operation with the deterministic ID `%010d-%04d-%02d`. It carries the operation
+type, effective source account, operation-body XDR and matching operation
+result, and supports type and source-account filters.
+
+### Footprint conflicts (`--detect-conflicts`)
+
+The tailer's reorder buffer closes a ledger before `FootprintAnalyzer` examines
+its Soroban transaction footprints. A key is reported when transactions share
+it and at least one access is read-write. The same conflict is attached to
+each participating transaction, allowing both human warnings and structured
+NDJSON consumers to identify hot keys and transaction sets.
+
+### Simulation streams (`prism simulate`)
+
+`SimulationSource` polls the latest ledger, calls `simulateTransaction` once
+for each newly observed head, decodes Soroban resource estimates, and compares
+successive return values through stellar-xdr-lens before emitting changed
+fields.
+
 ## Rotating file sink (`--output-file` + `--rotate-*`)
 
 Every streaming command accepts `--output-file`. When set, the chosen format
@@ -349,7 +375,7 @@ rendered in Soroban type syntax, and `--function` plus repeated `--arg` decodes
 actual base64 `ScVal` values through lens against the named parameters.
 
 `getLedgerEntries` is an optional capability (`rpc.LedgerEntriesClient`), not
-part of the streaming `rpc.Client` interface. That keeps the four-method core
+part of the streaming `rpc.Client` interface. That keeps the core interface
 small and avoids forcing stream-only fakes to implement a method they never
 use. Only the `abi` command takes this path; every streaming command remains
 independent of it.
@@ -407,7 +433,7 @@ returning an error, so one malformed value cannot kill a long-running tail.
 
 ## Adding an RPC method
 
-`pkg/rpc.Client` has four methods. Every one added must also be implemented in
+`pkg/rpc.Client` has a small set of methods. Every one added must also be implemented in
 `internal/fakerpc`, so prefer composing the existing calls. The interface is
 small on purpose: it is the boundary that keeps the entire streaming core
 testable without a network.

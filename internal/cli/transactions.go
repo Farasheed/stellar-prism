@@ -10,6 +10,7 @@ import (
 
 func newTransactionsCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 	var sf streamFlags
+	var detectConflicts bool
 
 	cmd := &cobra.Command{
 		Use:   "transactions",
@@ -46,11 +47,21 @@ Transactions can be streamed continuously by using the --follow flag.`,
 					PageLimit:   sf.pageSize,
 				}), nil
 			}
+			if detectConflicts {
+				analyzer := stream.NewFootprintAnalyzer()
+				sf.process = analyzer.Analyze
+				// Conflict analysis needs complete same-ledger transaction sets;
+				// concurrent range workers would merge directly into the sink and
+				// bypass the Tailer's ledger reorder/processing stage.
+				sf.backfillWorkers = 1
+			}
 			return runStream(cmd.Context(), newSource, from, &sf, g, stdout, stderr)
 		},
 	}
 
 	sf.register(cmd, stream.DefaultTransactionPageLimit)
+	cmd.Flags().BoolVar(&detectConflicts, "detect-conflicts", false,
+		"annotate Soroban transactions with same-ledger read/write footprint conflicts")
 	registerFlagCompletion(cmd, "gap-strategy", string(stream.GapFail), string(stream.GapResume))
 	return cmd
 }

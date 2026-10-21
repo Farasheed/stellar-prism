@@ -58,6 +58,9 @@ type Options struct {
 	MaxGapRecoveries int
 	// OnGap, when set, is called for every detected gap.
 	OnGap func(GapEvent)
+	// Process transforms a complete ledger's records before they are emitted.
+	// It is used by derived streams such as footprint conflict detection.
+	Process func([]Record) ([]Record, error)
 }
 
 // Tailer drives a Source, emitting records to a Sink.
@@ -96,6 +99,7 @@ type Tailer struct {
 
 	stats    Stats
 	recovery GapRecovery
+	reorder  *ReorderBuffer
 }
 
 // NewTailer returns a Tailer wired to src and sink.
@@ -122,6 +126,7 @@ func NewTailer(src Source, sink Sink, opts Options) *Tailer {
 			MaxRecoveries: opts.MaxGapRecoveries,
 			OnGap:         opts.OnGap,
 		},
+		reorder: NewReorderBuffer(),
 	}
 }
 
@@ -205,6 +210,11 @@ func (t *Tailer) Run(ctx context.Context) error {
 // finish flushes and returns err, converting a flush failure into the error
 // when there is no more pressing one to report.
 func (t *Tailer) finish(err error) error {
+	if err == nil && (t.opts.Limit == 0 || t.stats.Emitted < t.opts.Limit) {
+		if _, flushErr := t.emitReady(t.reorder.Flush()); flushErr != nil {
+			return flushErr
+		}
+	}
 	if flushErr := t.sink.Flush(); flushErr != nil && err == nil {
 		return fmt.Errorf("flushing output: %w", flushErr)
 	}
@@ -271,7 +281,20 @@ func (t *Tailer) checkGap(b Batch) *GapError {
 // emit writes a batch's records, suppressing any the server replayed, and
 // reports whether the configured limit has been reached.
 func (t *Tailer) emit(b Batch) (done bool, err error) {
-	for _, r := range b.Records {
+	return t.emitReady(t.reorder.Add(b.Records))
+}
+
+func (t *Tailer) emitReady(records []Record) (done bool, err error) {
+	if len(records) == 0 {
+		return false, nil
+	}
+	if t.opts.Process != nil {
+		records, err = t.opts.Process(records)
+		if err != nil {
+			return false, err
+		}
+	}
+	for _, r := range records {
 		// IDs are fixed-width and zero-padded, so this comparison is a
 		// chronological one. Anything at or before the high-water mark is a
 		// replay after a reconnect, or an out-of-order server response.

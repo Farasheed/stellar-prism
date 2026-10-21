@@ -187,10 +187,19 @@ func eventRecord(e protocol.EventInfo) Record {
 			TxHash:     e.TransactionHash,
 			TxIndex:    e.TxIndex,
 			OpIndex:    e.OpIndex,
+			EventIndex: eventIndex(e.ID),
 			TopicXDR:   e.TopicXDR,
 			ValueXDR:   e.ValueXDR,
 		},
 	}
+}
+
+func eventIndex(id string) uint32 {
+	c, err := protocol.ParseCursor(id)
+	if err != nil {
+		return 0
+	}
+	return c.Event
 }
 
 // filters builds the single server-side filter prism uses.

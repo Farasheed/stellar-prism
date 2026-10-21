@@ -98,6 +98,45 @@ type transactionLine struct {
 	EnvelopeXDR   string          `json:"envelopeXdr,omitempty"`
 	ResultXDR     string          `json:"resultXdr,omitempty"`
 	ResultMetaXDR string          `json:"resultMetaXdr,omitempty"`
+	Conflicts     []conflictLine  `json:"conflicts,omitempty"`
+}
+
+type conflictLine struct {
+	KeyXDR       string   `json:"keyXdr"`
+	ContractID   string   `json:"contract,omitempty"`
+	Transactions []string `json:"transactions"`
+}
+
+type operationLine struct {
+	Kind          string          `json:"kind"`
+	ID            string          `json:"id"`
+	Ledger        uint32          `json:"ledger"`
+	Time          string          `json:"time,omitempty"`
+	Index         uint32          `json:"index"`
+	Type          string          `json:"type"`
+	SourceAccount string          `json:"sourceAccount,omitempty"`
+	Parameters    json.RawMessage `json:"parameters,omitempty"`
+	ParametersXDR string          `json:"parametersXdr,omitempty"`
+	ResultCode    string          `json:"resultCode,omitempty"`
+	Result        json.RawMessage `json:"result,omitempty"`
+	ResultXDR     string          `json:"resultXdr,omitempty"`
+	TxHash        string          `json:"tx,omitempty"`
+}
+
+type simulationLine struct {
+	Kind           string                     `json:"kind"`
+	ID             string                     `json:"id"`
+	Ledger         uint32                     `json:"ledger"`
+	Time           string                     `json:"time,omitempty"`
+	Error          string                     `json:"error,omitempty"`
+	ReturnValue    json.RawMessage            `json:"returnValue,omitempty"`
+	ReturnValueXDR string                     `json:"returnValueXdr,omitempty"`
+	Instructions   uint32                     `json:"instructions"`
+	DiskReadBytes  uint32                     `json:"diskReadBytes"`
+	WriteBytes     uint32                     `json:"writeBytes"`
+	MinResourceFee int64                      `json:"minResourceFee"`
+	Changed        []string                   `json:"changed,omitempty"`
+	Previous       *stream.SimulationSnapshot `json:"previous,omitempty"`
 }
 
 // storageChangeLine is the documented NDJSON shape for a storage mutation.
@@ -254,6 +293,54 @@ func (n *NDJSON) encode(r stream.Record) error {
 				line.EnvelopeXDR = r.Transaction.EnvelopeXDR
 				line.ResultXDR = r.Transaction.ResultXDR
 				line.ResultMetaXDR = r.Transaction.ResultMetaXDR
+			}
+			for _, conflict := range r.Transaction.Conflicts {
+				line.Conflicts = append(line.Conflicts, conflictLine{
+					KeyXDR: conflict.KeyXDR, ContractID: conflict.ContractID, Transactions: conflict.Transactions,
+				})
+			}
+		}
+		payload = line
+
+	case stream.KindOperation:
+		line := operationLine{Kind: string(r.Kind), ID: r.ID, Ledger: r.Sequence, Time: formatTime(r.Time)}
+		if op := r.Operation; op != nil {
+			line.Index, line.Type, line.SourceAccount, line.ResultCode, line.TxHash = op.Index, op.Type, op.SourceAccount, op.ResultCode, op.TransactionHash
+			if n.decode {
+				if op.ParametersXDR != "" {
+					raw, err := n.decodeXDR(op.ParametersXDR)
+					if err != nil {
+						return err
+					}
+					line.Parameters = raw
+				}
+				if op.ResultXDR != "" {
+					raw, err := n.decodeXDR(op.ResultXDR)
+					if err != nil {
+						return err
+					}
+					line.Result = raw
+				}
+			} else {
+				line.ParametersXDR, line.ResultXDR = op.ParametersXDR, op.ResultXDR
+			}
+		}
+		payload = line
+
+	case stream.KindSimulation:
+		line := simulationLine{Kind: string(r.Kind), ID: r.ID, Ledger: r.Sequence, Time: formatTime(r.Time)}
+		if sim := r.Simulation; sim != nil {
+			line.Ledger, line.Error = sim.Ledger, sim.Error
+			line.Instructions, line.DiskReadBytes, line.WriteBytes, line.MinResourceFee = sim.Instructions, sim.DiskReadBytes, sim.WriteBytes, sim.MinResourceFee
+			line.Changed, line.Previous = sim.Changed, sim.Previous
+			if n.decode && sim.ReturnValueXDR != "" {
+				raw, err := n.decodeXDR(sim.ReturnValueXDR)
+				if err != nil {
+					return err
+				}
+				line.ReturnValue = raw
+			} else {
+				line.ReturnValueXDR = sim.ReturnValueXDR
 			}
 		}
 		payload = line

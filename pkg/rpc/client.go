@@ -3,8 +3,8 @@
 //
 // The Client interface exists so the streaming state machine can be tested
 // without a network. Everything prism does against RPC goes through these
-// three methods, which keeps the fake in internal/fakerpc small enough to
-// reason about.
+// a small set of methods, which keeps the fake in internal/fakerpc small
+// enough to reason about.
 package rpc
 
 import (
@@ -31,7 +31,7 @@ const URLEnvVar = "SOROBAN_RPC_URL"
 
 // Client is the subset of Soroban RPC that prism uses.
 //
-// It is deliberately tiny: four read methods, all taking a context. New
+// It is deliberately tiny: read methods, all taking a context. New
 // stream sources should prefer composing these over widening the interface,
 // because every method added here must also be faked in tests.
 type Client interface {
@@ -48,6 +48,10 @@ type Client interface {
 
 	// GetTransactions returns transactions matching the request.
 	GetTransactions(ctx context.Context, req protocol.GetTransactionsRequest) (protocol.GetTransactionsResponse, error)
+
+	// SimulateTransaction estimates resource usage and authorization for a
+	// transaction envelope without submitting it.
+	SimulateTransaction(ctx context.Context, req protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error)
 
 	// GetLatestLedger reports the head of the chain, which is how a stream
 	// with no explicit start ledger works out where "now" is.
@@ -131,7 +135,7 @@ func (c *SDKClient) GetLedgers(ctx context.Context, req protocol.GetLedgersReque
 // GetLedgerEntries returns the requested ledger entries.
 //
 // It is deliberately not part of Client: the streaming core only needs the
-// four methods above, and keeping the interface small avoids forcing every
+// core methods above, and keeping the interface small avoids forcing every
 // test double to implement a method it never uses. Callers that need it, such
 // as contract ABI resolution, assert for LedgerEntriesClient instead.
 func (c *SDKClient) GetLedgerEntries(ctx context.Context, req protocol.GetLedgerEntriesRequest) (protocol.GetLedgerEntriesResponse, error) {
@@ -162,6 +166,15 @@ func (c *SDKClient) GetTransactions(ctx context.Context, req protocol.GetTransac
 	resp, err := c.inner.GetTransactions(ctx, req)
 	if err != nil {
 		return resp, fmt.Errorf("rpc getTransactions: %w", err)
+	}
+	return resp, nil
+}
+
+// SimulateTransaction implements Client.
+func (c *SDKClient) SimulateTransaction(ctx context.Context, req protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
+	resp, err := c.inner.SimulateTransaction(ctx, req)
+	if err != nil {
+		return resp, fmt.Errorf("rpc simulateTransaction: %w", err)
 	}
 	return resp, nil
 }

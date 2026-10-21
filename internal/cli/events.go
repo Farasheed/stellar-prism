@@ -38,6 +38,7 @@ type streamFlags struct {
 	maxGapRecoveries int
 	quiet            bool
 	verbosity        int
+	process          func([]stream.Record) ([]stream.Record, error)
 
 	output         string
 	rotateSize     int64
@@ -386,6 +387,7 @@ func runStream(
 	if err != nil {
 		return err
 	}
+	opts.Process = sf.process
 
 	if sf.from > 0 && sf.backfillWorkers > 1 {
 		drainer, err := stream.NewDrainer(stream.DrainerConfig{
