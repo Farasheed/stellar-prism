@@ -2,7 +2,6 @@ package stream
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -25,6 +24,28 @@ type Stats struct {
 	Fetches int
 	// Retries counts fetches that failed and were retried.
 	Retries int
+	// Gaps counts retention gaps the stream detected.
+	Gaps int
+	// Recovered counts gaps the stream skipped past under GapResume.
+	Recovered int
+}
+
+// Page describes the progress of one page that was emitted in full.
+//
+// It carries the position a later run could resume from, which is what makes
+// a durable cursor possible without the tailer knowing anything about
+// storage.
+type Page struct {
+	// Source names the stream that produced the page.
+	Source string
+	// Cursor is the position to resume from after this page. It is empty
+	// when the source offers no further position.
+	Cursor string
+	// Ledger is the ledger the cursor refers to, or zero when the source
+	// cannot say.
+	Ledger uint32
+	// Records counts the records emitted in the page.
+	Records int
 }
 
 // Options configures a Tailer.
@@ -56,9 +77,31 @@ type Options struct {
 	AdaptiveMax time.Duration
 	// Clock is injectable for tests. Defaults to RealClock.
 	Clock Clock
+	// StartCursor resumes the stream from a position an earlier run
+	// recorded. The empty value means "start where the Source was
+	// configured to start".
+	//
+	// A resumed stream is gap-checked like any other, because the cursor is
+	// a real position and the server may have pruned past it.
+	StartCursor string
 	// OnRetry, when set, is called before each backoff wait so the CLI can
 	// tell the user what is happening rather than appearing to hang.
 	OnRetry func(attempt int, delay time.Duration, err error)
+	// GapStrategy selects what to do when the server has pruned records.
+	// The empty value means GapFail.
+	GapStrategy GapStrategy
+	// MaxGapRecoveries bounds how many times GapResume may skip ahead. Zero
+	// means no bound.
+	MaxGapRecoveries int
+	// OnGap, when set, is called for every detected gap.
+	OnGap func(GapEvent)
+	// OnPage, when set, is called after every page that was emitted in
+	// full, with the position to resume from.
+	//
+	// A page that was only partly emitted — because the limit was reached
+	// or the sink failed — does not produce a callback, so a recorded
+	// position always refers to records that were actually delivered.
+	OnPage func(Page)
 }
 
 // Tailer drives a Source, emitting records to a Sink.
@@ -80,8 +123,9 @@ type Options struct {
 //
 //   - Not exactly-once across restarts. The tailer cannot atomically emit a
 //     record and commit its cursor, so a process killed between the two will
-//     re-emit on restart. Durable cursors would narrow this and are on the
-//     roadmap; consumers that care should key off Record.ID.
+//     re-emit on restart. Options.StartCursor and Options.OnPage narrow that
+//     window to a single record for callers that persist the position
+//     themselves; consumers that care should key off Record.ID.
 type Tailer struct {
 	src  Source
 	sink Sink
@@ -95,7 +139,8 @@ type Tailer struct {
 	// correctly, which is what makes de-duplication a single comparison.
 	lastID string
 
-	stats Stats
+	stats    Stats
+	recovery GapRecovery
 
 	// adaptive is non-nil only when Options.Adaptive is set, and then drives
 	// the wait between polls instead of the fixed interval.
@@ -116,7 +161,21 @@ func NewTailer(src Source, sink Sink, opts Options) *Tailer {
 	if opts.Backoff.Initial == 0 && opts.Backoff.Max == 0 {
 		opts.Backoff = DefaultBackoff()
 	}
-	t := &Tailer{src: src, sink: sink, opts: opts}
+	strategy, err := ParseGapStrategy(string(opts.GapStrategy))
+	if err != nil {
+		strategy = GapFail
+	}
+	t := &Tailer{
+		src:    src,
+		sink:   sink,
+		opts:   opts,
+		cursor: opts.StartCursor,
+		recovery: GapRecovery{
+			Strategy:      strategy,
+			MaxRecoveries: opts.MaxGapRecoveries,
+			OnGap:         opts.OnGap,
+		},
+	}
 	if opts.Adaptive {
 		t.adaptive = NewAdaptivePoller(opts.AdaptiveMin, opts.AdaptiveMax, 2)
 	}
@@ -180,22 +239,39 @@ func (t *Tailer) Run(ctx context.Context) error {
 
 		batch, err := t.fetchWithRetry(ctx)
 		if err != nil {
-			if isCancellation(err) {
+			if IsCancellation(err) {
 				return t.finish(nil)
 			}
 			return err
 		}
 
-		if err := t.checkGap(batch); err != nil {
-			return err
+		if gapErr := t.checkGap(batch); gapErr != nil {
+			t.stats.Gaps++
+			recovered, recoverErr := t.recovery.Handle(t.src, gapErr)
+			if recoverErr != nil {
+				return recoverErr
+			}
+			if recovered {
+				t.stats.Recovered = t.recovery.Recovered()
+				t.cursor = ""
+				continue
+			}
 		}
 
-		done, err := t.emit(batch)
+		done, emitted, err := t.emit(batch)
 		if err != nil {
 			return err
 		}
 		if done {
 			return t.finish(nil)
+		}
+
+		// The page was emitted in full, so this is a position a later run
+		// could resume from. Reporting it here — rather than when the page
+		// was fetched — is what keeps a recorded cursor from pointing past
+		// records that were never delivered.
+		if t.reportsPage(batch) {
+			t.notifyPage(batch, emitted)
 		}
 
 		// Advance only after a fully successful emit. If emitting failed we
@@ -242,7 +318,7 @@ func (t *Tailer) fetchWithRetry(ctx context.Context) (Batch, error) {
 			return batch, nil
 		}
 
-		if isCancellation(err) {
+		if IsCancellation(err) {
 			return Batch{}, err
 		}
 		if !rpc.IsRetryable(err) {
@@ -274,7 +350,7 @@ func (t *Tailer) fetchWithRetry(ctx context.Context) (Batch, error) {
 // It only applies once a cursor exists: the first fetch has not resumed from
 // anywhere, and an out-of-range start ledger is rejected by the server with a
 // clearer message than this check could produce.
-func (t *Tailer) checkGap(b Batch) error {
+func (t *Tailer) checkGap(b Batch) *GapError {
 	if t.cursor == "" || b.Oldest == 0 {
 		return nil
 	}
@@ -288,9 +364,35 @@ func (t *Tailer) checkGap(b Batch) error {
 	return nil
 }
 
+// reportsPage reports whether a page moved the stream forward.
+//
+// An empty page that leaves the cursor where it was says nothing new, and
+// reporting it would fill a cursor journal with duplicates of the position
+// already recorded.
+func (t *Tailer) reportsPage(b Batch) bool {
+	return len(b.Records) > 0 || (b.NextCursor != "" && b.NextCursor != t.cursor)
+}
+
+// notifyPage reports the progress of a fully emitted page.
+func (t *Tailer) notifyPage(b Batch, emitted int) {
+	if t.opts.OnPage == nil {
+		return
+	}
+	page := Page{
+		Source:  t.src.Name(),
+		Cursor:  b.NextCursor,
+		Records: emitted,
+	}
+	if ledger, ok := t.src.CursorLedger(b.NextCursor); ok {
+		page.Ledger = ledger
+	}
+	t.opts.OnPage(page)
+}
+
 // emit writes a batch's records, suppressing any the server replayed, and
-// reports whether the configured limit has been reached.
-func (t *Tailer) emit(b Batch) (done bool, err error) {
+// reports whether the configured limit has been reached along with how many
+// records were written.
+func (t *Tailer) emit(b Batch) (done bool, emitted int, err error) {
 	for _, r := range b.Records {
 		// IDs are fixed-width and zero-padded, so this comparison is a
 		// chronological one. Anything at or before the high-water mark is a
@@ -301,18 +403,15 @@ func (t *Tailer) emit(b Batch) (done bool, err error) {
 		}
 
 		if err := t.sink.Emit(r); err != nil {
-			return false, fmt.Errorf("writing record %s: %w", r.ID, err)
+			return false, emitted, fmt.Errorf("writing record %s: %w", r.ID, err)
 		}
 		t.lastID = r.ID
 		t.stats.Emitted++
+		emitted++
 
 		if t.opts.Limit > 0 && t.stats.Emitted >= t.opts.Limit {
-			return true, nil
+			return true, emitted, nil
 		}
 	}
-	return false, nil
-}
-
-func isCancellation(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	return false, emitted, nil
 }

@@ -8,6 +8,57 @@ import (
 	"github.com/stellar-optics/stellar-prism/internal/fakerpc"
 )
 
+// This file lives in the internal test package because it asserts on the
+// poller's unexported tuning state, and the internal and external test
+// packages cannot see each other's helpers — so the clock and sink doubles
+// below mirror the ones tail_test.go defines for `package stream_test`.
+
+// fakeClock replaces wall time with a recorded list of sleeps, so the follow
+// loop's waits can be asserted exactly.
+type fakeClock struct {
+	now   time.Time
+	slept []time.Duration
+
+	// maxSleeps bounds how long a follow loop may run. Without it, a
+	// regression that stops the tailer terminating turns a failing test into
+	// a hanging one, which is far harder to diagnose in CI.
+	maxSleeps int
+	onBudget  func()
+}
+
+func newFakeClock() *fakeClock {
+	return &fakeClock{now: time.Unix(1700000000, 0).UTC()}
+}
+
+func (c *fakeClock) Now() time.Time { return c.now }
+
+func (c *fakeClock) Sleep(ctx context.Context, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.slept = append(c.slept, d)
+	c.now = c.now.Add(d)
+	if c.maxSleeps > 0 && len(c.slept) >= c.maxSleeps && c.onBudget != nil {
+		c.onBudget()
+	}
+	return ctx.Err()
+}
+
+// collector records everything emitted, which is what the delivery
+// guarantee's invariants are checked against.
+type collector struct {
+	ids     []string
+	records []Record
+}
+
+func (c *collector) Emit(r Record) error {
+	c.ids = append(c.ids, r.ID)
+	c.records = append(c.records, r)
+	return nil
+}
+
+func (c *collector) Flush() error { return nil }
+
 // TestAdaptivePollerBounds checks the tuning invariant from both sides: no
 // sequence of observations can push the wait below Min or past Max.
 func TestAdaptivePollerBounds(t *testing.T) {

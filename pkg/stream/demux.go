@@ -4,6 +4,7 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // ErrDemuxClosed is returned by Submit and Subscribe after Close has begun.
@@ -17,6 +18,9 @@ var ErrDemuxClosed = errors.New("demux is closed")
 const (
 	DefaultQueueCapacity      = 256
 	DefaultSubscriberCapacity = 128
+	// DefaultDemuxDropAfter is how long the dispatcher waits on a full
+	// subscriber queue before counting the record dropped.
+	DefaultDemuxDropAfter = 100 * time.Millisecond
 )
 
 // DemuxOptions tunes a Demux. Zero fields fall back to the defaults above.
@@ -29,6 +33,13 @@ type DemuxOptions struct {
 	// so one wedged consumer cannot stall the other contracts' output.
 	// Zero uses DefaultSubscriberCapacity.
 	SubscriberCapacity int
+	// DropAfter bounds how long the dispatcher waits on a full subscriber
+	// queue before counting the record as dropped. It is what separates a
+	// subscriber that is merely busy — one that catches up within the grace
+	// loses nothing — from a wedged one, which cannot hold the dispatcher,
+	// and the other contracts, hostage beyond the grace. Zero uses
+	// DefaultDemuxDropAfter.
+	DropAfter time.Duration
 }
 
 // DemuxStats is a snapshot of what a Demux has routed so far.
@@ -58,9 +69,10 @@ type DemuxStats struct {
 //     order. De-duplication is the tailer's job upstream of Submit; the demux
 //     adds none of its own.
 //   - Backpressure. Submit blocks while the intake queue is full. A slow,
-//     still-reading subscriber first fills its queue and is then skipped with
-//     a counted drop, so one wedged consumer cannot stall the other
-//     contracts; nothing grows without bound.
+//     still-reading subscriber first fills its queue and is then given a
+//     bounded grace before being skipped with a counted drop, so a wedged
+//     consumer cannot stall the other contracts and nothing grows without
+//     bound.
 //   - Termination. Submit never panics on a closed channel, because the
 //     dispatcher never closes the intake. Close drains everything accepted
 //     before it, closes each per-subscriber queue from the dispatcher (the
@@ -118,6 +130,9 @@ func NewDemux(opts DemuxOptions) *Demux {
 	if opts.SubscriberCapacity <= 0 {
 		opts.SubscriberCapacity = DefaultSubscriberCapacity
 	}
+	if opts.DropAfter <= 0 {
+		opts.DropAfter = DefaultDemuxDropAfter
+	}
 	d := &Demux{
 		opts:   opts,
 		in:     make(chan Record, opts.QueueCapacity),
@@ -155,9 +170,10 @@ func (d *Demux) dispatch() {
 }
 
 // route delivers r to the subscriber for its contract, or counts it unrouted.
-// Sending is non-blocking by design: a subscriber that is still draining but
-// slow loses the head of the queue by being skipped, never by wedging every
-// other contract behind it.
+// A full subscriber queue costs the dispatcher a bounded wait rather than an
+// immediate drop: a slow but progressing consumer keeps every record, while
+// a wedged one is skipped after the grace, so one stalled contract cannot
+// hold the others behind it.
 func (d *Demux) route(r Record) {
 	if r.Kind != KindEvent || r.Event == nil {
 		d.unrouted.Add(1)
@@ -170,9 +186,17 @@ func (d *Demux) route(r Record) {
 		d.unrouted.Add(1)
 		return
 	}
+	// Fast path: the common case costs no timer.
 	select {
 	case s.queue <- r:
+		return
 	default:
+	}
+	timer := time.NewTimer(d.opts.DropAfter)
+	defer timer.Stop()
+	select {
+	case s.queue <- r:
+	case <-timer.C:
 		s.drop.Add(1)
 		d.unrouted.Add(1)
 	}
@@ -242,6 +266,15 @@ func (d *Demux) releaseSubscribers() {
 // full — the same natural backpressure a synchronous Sink applies. After
 // Close it returns ErrDemuxClosed instead of sending.
 func (d *Demux) Submit(r Record) error {
+	// The closed channel is checked first so a Submit after Close is refused
+	// deterministically: the intake is never closed (that is what makes a
+	// racing Submit panic-free), so its buffer stays sendable and a bare
+	// select would take the send case whenever the buffer had room.
+	select {
+	case <-d.closer:
+		return ErrDemuxClosed
+	default:
+	}
 	select {
 	case d.in <- r:
 		d.submitted.Add(1)

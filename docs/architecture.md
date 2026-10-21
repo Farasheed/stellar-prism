@@ -27,26 +27,56 @@ RPC ───►│  Source  ├───────────►│ Tailer �
         └──────────┘            └────────┘            └──────┘
          events.go               tail.go               ndjson.go
          ledgers.go            cursor, dedup,          human.go
-                               backoff, gaps            (via lens)
+         transactions.go       backoff, gaps           file_rotator.go
+         storage_changes.go                          (via lens)
+         wasm_events.go
+              ▲
+              │ (optional)
+         stream.Pool  — round-robin + failover over several RPC URLs
+
+        ┌────────┐  OnPage: the position each delivered page reached
+        │ Tailer ├───┐
+        └────────┘   │  ┌──────────┐  append  ┌──────────────────┐
+                      └─►│  Pruner  ├─────────►│ cursor journal   │  --state-file
+                         └──────────┘  prune   └──────────────────┘
+                         pruning.go            cursor_store.go
 ```
 
 One goroutine, no channels. The tailer fetches a page, emits its records
 synchronously, advances the cursor, and repeats. Concurrency would buy nothing
-— the bottleneck is the network — and would cost determinism in tests.
+— the bottleneck is the network — and would cost determinism in tests. The
+pruner is the one addition: it owns a single background goroutine, and the
+command joins it before it exits.
 
 ## Package layout
 
 ```
 cmd/prism/            main; maps errors to exit codes
+  gendocs.go          man page and Markdown generator
 internal/cli/         cobra commands — thin wrappers over pkg/stream
+  color.go            --color parsing and NO_COLOR handling
+  completion.go       bash/zsh/fish/powershell script generation
+  abi_resolve.go      contract WASM lookup and embedded-spec parsing
+  state.go            the cursor journal, the pruner, and the resume point
+  syncwriter.go       serialised stderr, for the diagnostics several goroutines write
 internal/fakerpc/     scriptable in-memory RPC for tests
-pkg/rpc/              the four-method Client interface + SDK adapter
+pkg/rpc/              the Client interface + SDK adapter
 pkg/stream/
   record.go           Record: the neutral item every source produces
   source.go           Source and Sink interfaces, GapError   ← the seams
   tail.go             the state machine
   events.go           contract events source
   ledgers.go          ledger close source
+  transactions.go     transaction source
+  storage_changes.go  contract storage mutations (from tx meta)
+  wasm_events.go      WASM uploads and contract deployments
+  pool.go             multi-endpoint failover RPC client
+  drainer.go          concurrent historical backfill + ordered merge
+  batcher.go          count/time batching sink wrapper
+  gap_recovery.go     GapStrategy, Rewinder and gap handling
+  pruning.go          CursorMetadata, MetadataStore, Pruner
+  cursor_store.go     file-backed cursor metadata journal
+  context.go          TaskGroup and cancellation helpers
   clock.go            Clock and Backoff, both injectable
   topic_pattern.go    client-side topic matching over decoded text
   demux.go            per-contract fan-out, queues + one goroutine each
@@ -55,6 +85,7 @@ pkg/stream/
 pkg/sink/
   ndjson.go           NDJSON, one object per line
   human.go            terminal output, payloads via lens
+  file_rotator.go     size/time rotating file sink, optional gzip
 ```
 
 ## The state machine
@@ -121,9 +152,18 @@ response, so the condition is directly observable:
 if cursorLedger < batch.Oldest { return &GapError{...} }
 ```
 
-prism reports the missed range and exits 2. It does **not** silently resume
-from the oldest available ledger — a stream with an unannounced hole is worse
-than one that stops, especially for anything auditing contract activity.
+By default prism reports the missed range and exits 2. It does **not**
+silently resume from the oldest available ledger — a stream with an
+unannounced hole is worse than one that stops, especially for anything
+auditing contract activity.
+
+`--gap-strategy resume` opts into a different policy. The tailer calls
+`Rewind(batch.Oldest)` on sources that implement `Rewinder`, clears the
+cursor, and fetches again from the oldest retained ledger. The skipped range
+is still announced: it reaches `Options.OnGap`, the CLI prints it on stderr,
+and `Stats.Gaps` / `Stats.Recovered` count it. `--max-gap-recoveries` bounds
+how many times a stream may skip ahead. A source without `Rewinder` cannot
+resume and fails exactly as it would under the default policy.
 
 ### Backpressure
 
@@ -131,6 +171,13 @@ than one that stops, especially for anything auditing contract activity.
 blocks the write, which blocks the poll loop. That is correct backpressure
 with no queue to grow. It is also why both sinks flush per record: a tail that
 buffers looks like a tail that has hung.
+
+`--batch` changes the unit of work, not the backpressure: `Batcher` buffers
+records until `--batch-size` is reached or `--batch-timeout` elapses, then
+hands the whole slice to the sink. It uses a single timer, not a goroutine,
+and `Close` stops the timer and flushes the remainder, so Ctrl-C cannot leave
+a buffered record behind. Sinks that implement `BatchSink` (both built-ins do)
+flush once per batch; other sinks are driven with one `Emit` per record.
 
 ### --since: relative windows, offline and approximate
 
@@ -180,6 +227,35 @@ defaults 1s..30s) keep the invariant: never faster than Min, never slower
 than Max. Jitter spreads each returned wait over its lower half so several
 prism instances do not poll in phase. The tuner is one number in one
 goroutine, so its tests run deterministically — no wall-clock flakiness.
+### Parallel historical backfill
+
+`--backfill-workers N` (with an explicit `--from`) uses `Drainer` instead of
+the sequential tailer for the historical phase. It probes the source once to
+learn the retention bounds, splits the ledger range into N contiguous chunks,
+and gives each worker its own `Source` and cursor. Workers stop at their chunk
+boundary, so no ledger is fetched twice.
+
+Records from the workers are merged by ID through a small heap before reaching
+the sink. That preserves the same ordering and de-duplication guarantee as the
+sequential tailer without buffering the whole backfill in memory: at most one
+page per worker is live at a time. A full page is fetched ahead by a worker
+while the merge consumes the previous one, so fetching is genuinely
+concurrent. After the historical phase the CLI either exits (`--follow` is
+off) or starts a normal tailer at `Until()+1`.
+
+If `--from` predates the retention window, the probe handles the gap according
+to `--gap-strategy`. A gap discovered inside a worker is handled the same way,
+or returned as a `*GapError` under the default policy.
+
+### Cancellation and goroutine ownership
+
+`TaskGroup` in `context.go` is the one place that starts concurrent workers.
+The first non-cancellation error cancels every sibling; `Wait` blocks until
+all workers have returned and then cancels the shared context. A caller
+cancellation is a clean stop, not an error. `Drainer.Run` waits for every
+worker on every path, including sink failure and limit exhaustion, soa terminated backfill cannot leak goroutines or leave a worker writing to a
+closed sink.
+
 
 ### What is deliberately *not* handled
 
@@ -188,6 +264,180 @@ immediate finality, and there is no reorg. Code to handle rewritten history
 would be untestable and would imply a hazard that does not exist. The
 realistic adjacent failure is a load-balanced RPC pool serving from a lagging
 backend, which reports an *older* `LatestLedger`; that case is tested.
+
+## Multi-endpoint failover (`pkg/stream/pool.go`)
+
+`--rpc-url` may be repeated (or `SOROBAN_RPC_URL` may be comma-separated).
+With more than one URL, `internal/cli` builds a `stream.Pool` instead of a
+single `rpc.Client`, so every command gains failover without knowing about it.
+
+- Calls are distributed **round-robin** across healthy endpoints.
+- A retryable failure marks the endpoint unhealthy and puts it in a cooldown
+  (default 30s); the same call is retried on the next endpoint.
+- Permanent errors (`rpc.Permanent`) stop failover immediately — retrying a
+  malformed cursor on another backend cannot help.
+- When **every** endpoint is cooling down, the one closest to recovery is
+  still tried: a stale health mark is more likely than a total outage, and the
+  call itself is the authoritative check.
+- A background goroutine probes unhealthy endpoints (`GetLatestLedger`) and
+  restores them as they recover. `Close` cancels the probe and waits, so a
+  Pool never leaks a goroutine.
+
+Options: `WithHealthInterval` (0 disables the probe), `WithHealthTimeout`,
+`WithFailureCooldown`, `WithClientFactory` (tests inject fakes).
+
+## Derived transaction streams
+
+Soroban RPC has no dedicated endpoints for storage mutations or deployments.
+Both streams therefore wrap `TransactionSource` and decode each transaction's
+envelope / result metadata, so pagination, cursors and the tailer's delivery
+guarantee apply unchanged.
+
+### Contract storage changes (`prism storage`)
+
+`StorageChangeSource` decodes `ResultMetaXDR` and emits one record per
+contract-related ledger entry mutation: `contract_data`, `contract_code` or
+`ttl`, with change type `created` / `updated` / `removed` / `restored`.
+Filters (`--contract`, `--change`, `--entry`) are validated up front so a
+typo fails immediately rather than streaming nothing.
+
+### WASM uploads and deployments (`prism wasm`)
+
+`WASMSource` decodes each envelope's `InvokeHostFunction` operations and
+emits `upload` (sha256 of the WASM bytes) or `create` (contract ID derived
+from the network passphrase). Failed transactions are skipped unless
+`--include-failed` is set. Contract IDs use the same derivation as the
+network, so `--network-passphrase` must match the chain being streamed
+(defaults to testnet).
+
+Both sources synthesise fixed-width zero-padded IDs (`%010d-%06d-…`) from
+the ledger sequence, preserving the lexicographic-order contract the tailer
+depends on.
+
+## Cursor metadata and background pruning (`pkg/stream/pruning.go`)
+
+A long-running stream produces one checkpoint per page, and a page per ledger
+close. Left alone that journal grows without bound: a week of following a
+contract is hundreds of thousands of lines of metadata nobody asked for.
+
+`--state-file` makes the cursor durable. After every page that was emitted
+**in full**, prism records the position it reached, and a background pruner
+keeps the file from growing:
+
+| Flag | Meaning |
+|---|---|
+| `--state-file <path>` | the journal: one JSON checkpoint per line |
+| `--resume` | start this run from the last recorded position |
+| `--prune-interval` | how often the background pruner compacts the file |
+| `--prune-keep` | how many checkpoints to keep per stream |
+| `--prune-max-age` | how old a checkpoint may be before it is dropped |
+
+The pieces:
+
+| Type | Role |
+|---|---|
+| `stream.CursorMetadata` | one checkpoint: key, cursor, ledger, timestamp |
+| `stream.MetadataStore` | the seam: append, latest, prune |
+| `stream.FileMetadataStore` | the file-backed journal |
+| `stream.Pruner` | the background compactor |
+| `stream.Options.OnPage` | how the tailer reports a delivered page |
+| `stream.Options.StartCursor` | how a tailer resumes |
+| `stream.DrainerConfig.OnPage` | how a concurrent backfill reports a delivered page |
+
+**The checkpoint is written after the emit, not before.** `Options.OnPage`
+fires once a page has been delivered in full. A page cut short by `--limit`,
+or one the sink rejected, produces no checkpoint, so a recorded position can
+never point past records that were not delivered. The callback also skips a
+page that returned nothing and left the cursor where it was: that says
+nothing new, and reporting it would fill the journal with duplicates.
+
+**A concurrent backfill reports its position too.** `--backfill-workers`
+drains a historical range with several workers before the follow phase
+begins, so it is the phase that produces the most pages. `DrainerConfig.OnPage`
+carries the same `stream.Page` the tailer uses: the workers cover disjoint
+ledger ranges and their pages are merged by record ID, so the pages are
+delivered in ascending order and each reported position is further along than
+the last. A page the `--limit` cut short never reaches the callback.
+
+**The pruner owns one goroutine, and joins it.** `Pruner.Start` begins the
+loop; `Pruner.Close` cancels it and waits for it to return. The CLI closes
+the pruner before the command exits — including on Ctrl-C — so an
+interrupted stream leaves nothing running behind it. A failed pass is
+reported on stderr and the loop continues: a file that cannot be compacted
+right now is no reason to stop streaming records.
+
+**Every `Close` waits, not only the first one.** `Pruner.Close` is safe to
+call more than once, and each caller waits for the goroutine to be joined. A
+second `Close` that returned early would report the pruner as stopped when
+it is not, and a caller that trusted that report could exit with the
+goroutine still alive.
+
+**Diagnostics are serialised.** The pruner reports what it compacted on
+stderr, and so does the stream — from a different goroutine. `runStream`
+wraps stderr in a mutex-guarded writer, so those lines cannot interleave
+mid-sentence and a test's stderr buffer cannot race. `fmt.Fprintf` formats
+into its own buffer and hands the result over in a single `Write`, so one
+lock acquisition covers one whole line.
+
+**The final compaction happens even on Ctrl-C.** When the command returns, the
+pruner is closed and one last pass runs against a context detached from the
+command's, so an interrupted run still leaves a compacted journal behind. A
+failure there is reported as the command's error rather than swallowed.
+
+**Rewrites are atomic.** The pruner writes the compacted journal to a
+temporary file in the same directory and renames it over the old one. A
+reader sees either the whole old file or the whole new one, and a crash
+mid-rewrite leaves the previous file intact. The file's permissions are
+carried over.
+
+**The prune pass streams.** It counts the entries per key in one pass and
+rewrites in a second, keeping only the newest `--prune-keep` per key in
+memory. The journal may be large; the pruner's memory footprint is not a
+function of its size.
+
+**A resumed stream is still gap-checked.** A recorded cursor is a real
+position, and the server may have pruned past it. Resuming from a stale
+checkpoint reports the missed range and exits 2, exactly like any other gap.
+
+**Resume is opt-in, and it is not exactly-once.** It narrows the restart
+window from "the whole run" to "one record"; a process killed between the
+emit and the write still re-emits. The README keeps saying so.
+
+**Migration notes.** Nothing existing changed: no CLI flag was renamed or
+removed, and no exported type lost a field or changed a signature. The
+feature adds to the public surface:
+
+| Added | Where |
+|---|---|
+| `stream.CursorMetadata`, `stream.MetadataStore`, `stream.PrunePolicy`, `stream.PruneStats`, `stream.PruneOptions`, `stream.PrunerStats` | `pkg/stream/pruning.go` |
+| `stream.MetadataStore`, `stream.PrunePolicy`, `stream.PruneStats`, `stream.FileMetadataStore` | `pkg/stream/cursor_store.go` |
+| `stream.Page` | `pkg/stream/tail.go` |
+| `stream.Options.OnPage`, `stream.Options.StartCursor` | `pkg/stream/tail.go` |
+| `stream.DrainerConfig.OnPage` | `pkg/stream/drainer.go` |
+| `--state-file`, `--resume`, `--prune-interval`, `--prune-keep`, `--prune-max-age` | every streaming command |
+
+`stream.Pruner` and `stream.FileMetadataStore` are new types rather than
+changes to existing ones, so a caller that ignores them compiles and behaves
+exactly as before. The one behavioural change visible to an existing caller
+is that a streaming command now reads `--state-file` before its first fetch;
+with no `--state-file` nothing is opened and nothing is written.
+
+## Rotating file sink (`--output-file` + `--rotate-*`)
+
+Every streaming command accepts `--output-file`. When set, the chosen format
+(NDJSON or human) is built on top of a `sink.RotatingWriter`:
+
+| Flag | Meaning |
+|---|---|
+| `--rotate-size` | rotate before a write would exceed N bytes |
+| `--rotate-interval` | rotate once the active file has been open this long |
+| `--rotate-compress` | gzip each rotated file |
+| `--rotate-keep` | keep at most N rotated files (0 keeps all) |
+
+Rotated files are named `<path>.<UTC timestamp>` (plus `.gz` when
+compressed). Rotation is synchronous; the active file is reopened before
+pruning, so a failed prune cannot stop the stream. `--rotate-*` without
+`--output-file` is rejected.
 
 ## Testing the guarantee
 
@@ -205,12 +455,25 @@ Every scenario funnels through one helper asserting three invariants:
    Counting records would not.
 
 Covered: clean streams, drops at every position, consecutive drops, replayed
-pages, out-of-order pages, retention overrun, lagging backends, permanent
-errors, retry exhaustion, cancellation mid-follow, sink failure, and
-full-page draining — plus the same guarantees through the seams this file
-describes below: adaptive poll waits, `--since` window arithmetic, client-
-side topic patterns, and demux routing under concurrent submitters (all
-race-detector checked via `go test -race`).
+pages, out-of-order pages, retention overrun with both gap policies, lagging
+backends, permanent errors, retry exhaustion, cancellation mid-follow, sink
+failure, full-page draining, concurrent backfill, batcher count/time/explicit
+flushes, and task-group cancellation. Gap recovery is also unit-tested
+without a network through the `Rewinder` seam.
+
+The cursor metadata store is tested the same way: appends and rewrites
+against a real file in a temporary directory, a pruner that keeps running
+after a failure, a pruner whose goroutine is joined rather than abandoned,
+and a tailer that resumes from a recorded cursor and is still gap-checked
+when it does. `internal/cli` runs the whole thing end to end against
+`internal/fakerpc`: a run that records checkpoints, a file that stays
+bounded while the stream runs, and a second run that picks up where the
+first stopped.
+
+The same guarantees also hold through the seams this file describes below:
+adaptive poll waits, `--since` window arithmetic, client-side topic
+patterns, and demux routing under concurrent submitters — all checked with
+`go test -race`.
 
 Time is injected via `Clock`, so there are no real sleeps and no wall-clock
 flakiness. Follow-loop tests carry a sleep budget that cancels the context, so
@@ -225,6 +488,12 @@ The invariants were verified by breaking the code on purpose:
 |---|---|
 | De-duplication disabled | `TestTailSuppressesReplayedPages` and `TestTailRejectsOutOfOrderPages` fail with exact diagnostics |
 | Gap detection disabled | `TestTailDetectsRetentionGap` fails in 0.00s |
+| Checkpoint written before the page was emitted | `TestTailDoesNotReportAPartiallyEmittedPage` and `TestTailDoesNotReportAPageTheSinkRejected` fail |
+| Pruner goroutine abandoned instead of joined | `TestPrunerCloseJoinsItsGoroutine` fails: `Close()` returned while the pruner was still running |
+| Second `Close` returning without joining the goroutine | `TestPrunerConcurrentCloseWaitsForTheGoroutine` fails: `Close() returned (<nil>) while the pruner was still running` |
+| Diagnostics written to stderr without serialisation | `TestSyncWriterSerialisesConcurrentWrites` fails with a `DATA RACE` report from the race detector |
+| Prune keeping the oldest entries | `TestFileMetadataStorePruneKeepsTheNewestPerKey` fails |
+| Final compaction at shutdown removed | `TestEventsCommandPrunesTheStateFile` fails: 10 checkpoints left instead of 2 |
 
 If you change the state machine, re-run that exercise. A test suite that
 cannot fail is not protecting anything.
@@ -245,6 +514,50 @@ prism does **no XDR decoding of its own**. Every payload goes through
 
 Shared CLI conventions: `--json`, `--color auto|always|never`, and the same
 exit-code meanings.
+
+## Colour control
+
+`--color` accepts exactly `auto`, `always` and `never`, and an invalid value is
+rejected before any command runs. `auto` colours only when the destination is a
+terminal, `TERM` is not `dumb`, and `NO_COLOR` is unset, following
+[no-color.org](https://no-color.org). `always` is an explicit operator request
+and therefore overrides `NO_COLOR`; `never` always wins in the other direction.
+The palette itself comes from lens, so prism and lens colour values identically.
+
+## Contract ABI resolution
+
+`prism abi <contract-id>` resolves a contract's spec without trusting a local
+file. The flow is two `getLedgerEntries` calls:
+
+1. The contract's persistent instance entry names its `ContractExecutable`.
+   For user contracts that is a WASM hash; the Stellar asset contract has no
+   embedded spec and is reported as such.
+2. The contract-code entry for that hash carries the WASM bytecode.
+
+The bytecode's `contractspecv0` custom section is a concatenated stream of
+`ScSpecEntry` XDR values. `abi_resolve.go` walks the WASM section framing,
+decodes each entry with the XDR stream decoder, and groups functions, structs,
+unions, enums, error enums and events. Function parameters and return types are
+rendered in Soroban type syntax, and `--function` plus repeated `--arg` decodes
+actual base64 `ScVal` values through lens against the named parameters.
+
+`getLedgerEntries` is an optional capability (`rpc.LedgerEntriesClient`), not
+part of the streaming `rpc.Client` interface. That keeps the four-method core
+small and avoids forcing stream-only fakes to implement a method they never
+use. Only the `abi` command takes this path; every streaming command remains
+independent of it.
+
+## Completions and generated documentation
+
+`prism completion <shell>` is pure command-tree traversal, so it makes no
+network calls. Command constructors register fixed value completions for
+enumerated flags (`--color`, `--type`, `--gap-strategy`); a new enum flag should
+call `registerFlagCompletion` next to its flag definition.
+
+`prism gendocs <man|markdown>` uses Cobra's document generators. It is attached
+to the root command from package main so `internal/cli` does not depend on the
+documentation packages. The generator disables Cobra's automatic timestamp tag
+so rerunning it does not dirty version control.
 
 ## Adding a stream source
 

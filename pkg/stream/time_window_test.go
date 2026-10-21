@@ -18,6 +18,9 @@ func TestStartLedgerForWindow(t *testing.T) {
 	tests := []struct {
 		name   string
 		window time.Duration
+		// latest overrides the head the window counts back from; zero means
+		// "use the table's default".
+		latest uint32
 		want   uint32
 	}{
 		{name: "one interval", window: 5 * time.Second, want: latest - 1},

@@ -69,46 +69,47 @@ type AdaptivePoller struct {
 // zero, or Grow under one, are pulled back to their defaults: a caller
 // passing nonsense gets a working poller, not a panic — the bounds exist to
 // protect the request budget, and clamping cannot violate them.
-func NewAdaptivePoller(min, max time.Duration, grow float64) *AdaptivePoller {
-	if min <= 0 {
-		min = DefaultAdaptiveMinPoll
+func NewAdaptivePoller(minPoll, maxPoll time.Duration, grow float64) *AdaptivePoller {
+	if minPoll <= 0 {
+		minPoll = DefaultAdaptiveMinPoll
 	}
-	if max < min {
-		max = min
+	if maxPoll < minPoll {
+		maxPoll = minPoll
 	}
 	if grow < 1 {
 		grow = 2
 	}
-	start := 2 * min
-	if start > max {
-		start = max
+	start := 2 * minPoll
+	if start > maxPoll {
+		start = maxPoll
 	}
-	return &AdaptivePoller{Min: min, Max: max, Grow: grow, current: start}
+	return &AdaptivePoller{Min: minPoll, Max: maxPoll, Grow: grow, current: start}
 }
 
 // Observe reports that newLedgers closed during the last wait and returns
 // the next wait. The first call only primes the poller and returns its
 // starting interval, because there is no earlier observation to tune from.
 func (a *AdaptivePoller) Observe(newLedgers int) time.Duration {
-	wait := a.current
 	if !a.started {
 		a.started = true
-		return a.jitter(wait)
+		return a.jitter(a.current)
 	}
 
 	g := a.Grow
 	if g < 1 {
 		g = 2
 	}
-	switch {
-	case newLedgers <= 0:
+	if newLedgers <= 0 {
+		// Dead time: stretch the wait.
 		a.current = clampDuration(float64(a.current)*g, a.Min, a.Max)
-	default:
+	} else {
 		// New ledgers arrived within the last wait: poll sooner.
 		a.current = clampDuration(float64(a.current)/g, a.Min, a.Max)
-		wait = a.current
 	}
-	return a.jitter(wait)
+	// The wait returned is always the freshly tuned one, so idle growth and
+	// busy shrinkage are both visible on the poll they caused rather than
+	// one poll later.
+	return a.jitter(a.current)
 }
 
 // jitter applies the same full-jitter shape Backoff uses, over the lower
@@ -126,12 +127,12 @@ func (a *AdaptivePoller) jitter(d time.Duration) time.Duration {
 	return time.Duration(half + half*r())
 }
 
-// clampDuration pulls v into [min, max] with float rounding, the only place
+// clampDuration pulls v into [lo, hi] with float rounding, the only place
 // float wait arithmetic is allowed to lose precision before it re-enters a
 // Duration.
-func clampDuration(v float64, min, max time.Duration) time.Duration {
+func clampDuration(v float64, lo, hi time.Duration) time.Duration {
 	return time.Duration(math.Min(
-		math.Max(v, float64(min)),
-		float64(max),
+		math.Max(v, float64(lo)),
+		float64(hi),
 	))
 }

@@ -35,7 +35,10 @@ func StartLedgerForWindow(latest uint32, window time.Duration) uint32 {
 	}
 
 	ledgersBack := roundUp(window) / RoughLedgerCloseInterval
-	if ledgersBack >= int64(latest) {
+	// The window is positive here, so ledgersBack is a non-negative count of
+	// intervals rather than a span of nanoseconds; only as a count can it be
+	// compared against a ledger sequence.
+	if int64(ledgersBack) >= int64(latest) {
 		// The window reaches before the first ledger ever closed.
 		return 1
 	}

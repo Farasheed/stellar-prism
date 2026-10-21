@@ -124,10 +124,30 @@ the terminal keeps the combined stream. `--adaptive` replaces the fixed
 during the last wait, so it tracks the network's own cadence between 1s and
 30s, jittered so several instances do not poll in phase.
 
+### Batched output and parallel backfill
+
+Batching trades a little latency for fewer sink writes. It is opt-in:
+
+```sh
+# Flush when 500 records accumulate or after 250ms, whichever comes first
+prism events --from 3966000 --follow --json --batch \
+  --batch-size 500 --batch-timeout 250ms
+```
+
+Historical backfill can fetch pages concurrently with `--backfill-workers`:
+
+```sh
+# Drain 24 hours of history with four overlapping fetch loops
+prism events --from 3966000 --limit 10000 --json --backfill-workers 4
+```
+
+Workers fetch disjoint ledger ranges, then records are merged by ID before
+they reach stdout, so output order and de-duplication are unchanged.
+
 ### NDJSON for pipelines
 
-`--json` emits one object per line, flushed per record, so a live stream pipes
-straight into `jq`:
+`--json` emits one object per line, flushed after each record (or batch), so a
+live stream pipes straight into `jq`:
 
 ```console
 $ prism events --limit 2 --json
@@ -146,8 +166,35 @@ $ prism events --limit 4 --json | jq -r '"\(.ledger)  \(.contract[0:8])…  \(.v
 3966820  CDLZFC3S…  ScValTypeScvI128
 ```
 
-### `prism tx` — why did this transaction fail?
+### Resuming a stream from where it stopped
 
+`--state-file` records the position the stream reached after every page, so
+the next run can pick the stream up where the last one stopped:
+
+```sh
+# Record the position as the stream runs
+prism events --contract CDLZF... --follow --state-file ~/.cache/prism/events.jsonl
+
+# Continue from the last recorded position
+prism events --contract CDLZF... --follow \
+  --state-file ~/.cache/prism/events.jsonl --resume
+```
+
+The file is a journal: one checkpoint per delivered page. A background pruner
+compacts it while the stream runs, so it stays small however long you follow.
+`--prune-keep` sets how many checkpoints to keep (100 by default),
+`--prune-max-age` drops the ones that are too old, and `--prune-interval` sets
+how often the compaction happens.
+
+A checkpoint is written only after a page has been delivered *in full*, so a
+recorded position never points past records the run did not emit. The same
+holds for a concurrent backfill (`--backfill-workers`): the drain reports the
+position it reached, and a page the `--limit` cut short is not reported at all.
+
+This narrows the restart window from "the whole run" to "one record". It is
+not exactly-once — see [What prism guarantees](#what-prism-guarantees).
+
+### `prism tx` — why did this transaction fail?
 Fetches a transaction and renders it through the lens explain path, pairing the
 envelope with its result so the failure is attributed to the operation that
 caused it:
@@ -194,14 +241,19 @@ This is a streaming tool, so the guarantee matters more than the feature list:
   reconnect is suppressed.
 - **A dropped connection cannot skip records.** A failed fetch is retried with
   the cursor *unchanged*.
-- **No silent gaps.** Records can only be genuinely lost by falling behind the
-  RPC's ~24-hour retention window. prism detects that against the server's
-  reported oldest ledger, prints the missed range, and **exits 2** rather than
-  carrying on with a hole in the stream.
+- **No silent gaps by default.** Records can only be genuinely lost by falling
+  behind the RPC's ~24-hour retention window. prism detects that against the
+  server's reported oldest ledger, prints the missed range, and **exits 2**
+  rather than carrying on with a hole in the stream. If losing the pruned range
+  is acceptable, `--gap-strategy resume` reports it and continues from the
+  oldest ledger the server still retains; the skip is counted in the stats and
+  printed on stderr.
 - **Not exactly-once across restarts.** prism cannot atomically emit a record
   and commit its cursor, so a process killed between the two re-emits on
-  restart. Key off `id` if that matters to you. Durable cursors are on the
-  [roadmap](docs/roadmap.md).
+  restart. `--state-file` records the position after every delivered page and
+  `--resume` starts the next run from it, which narrows that window to a
+  single record — but it is still not exactly-once. Key off `id` if that
+  matters to you.
 
 These are enforced by tests, not just claimed — see
 [docs/architecture.md](docs/architecture.md#testing-the-guarantee).
@@ -253,10 +305,15 @@ and [docs/architecture.md](docs/architecture.md).
 machine covered by tests that run with no network. The library API may shift
 before v1.0.
 
-- Event and ledger streams; `prism tx` via the lens explain path.
+- Event, ledger and transaction streams; `prism tx` via the lens explain path.
+- Count/time batching (`--batch`) and concurrent historical backfill
+  (`--backfill-workers`).
+- Explicit gap policy: stop by default, or `--gap-strategy resume` with the
+  skipped range reported.
 - Payloads render as the XDR wire shape — prism has no contract-spec decoding,
   and `stellar events` is better for that today.
-- No durable cursor yet, so exactly-once across restarts is not offered.
+- Optional cursor journal (`--state-file`) with background pruning, and
+  `--resume` to continue from it. Still not exactly-once across restarts.
 
 See [docs/roadmap.md](docs/roadmap.md).
 

@@ -112,7 +112,7 @@ func TestTopicPatternMatching(t *testing.T) {
 func TestTopicPatternCompileErrors(t *testing.T) {
 	t.Parallel()
 
-	sevenTopics := "a,a,a,a,a,a,a" // one past the server's five-plus-"**"
+	sevenTopics := "a,a,a,a,a,a,a" // one past the server's segment limit plus "**"
 	tests := []struct {
 		name string
 		spec string
@@ -121,7 +121,8 @@ func TestTopicPatternCompileErrors(t *testing.T) {
 		{name: "empty", spec: "", want: "empty topic pattern"},
 		{name: "empty segment", spec: "a,,b", want: "empty segment"},
 		{name: "double wildcard not last", spec: "a,**,b", want: "must be the last segment"},
-		{name: "too many segments", spec: sevenTopics, want: "at most 5"},
+		{name: "too many segments", spec: sevenTopics,
+			want: fmt.Sprintf("at most %d", stream.MaxTopicSegments)},
 		{name: "empty regex body", spec: "re:", want: "empty regular expression"},
 		{name: "invalid regex", spec: "re:[", want: "not a valid regular expression"},
 		{name: "empty prefix", spec: "prefix:", want: "empty prefix"},

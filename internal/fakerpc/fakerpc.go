@@ -10,6 +10,7 @@ package fakerpc
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sort"
@@ -17,6 +18,8 @@ import (
 	"time"
 
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
+	"github.com/stellar/go-stellar-sdk/strkey"
+	"github.com/stellar/go-stellar-sdk/xdr"
 )
 
 // ErrDropped simulates a connection failure. It matches prism's retryable
@@ -70,8 +73,13 @@ type Server struct {
 
 	// tx maps a hash to a canned transaction response.
 	tx map[string]protocol.GetTransactionResponse
-	// txs is the canned response for getTransactions.
+	// transactions is the ordered universe served by a transaction fake.
+	transactions []protocol.TransactionInfo
+	// txs is a canned response for getTransactions, used when transactions
+	// is empty.
 	txs protocol.GetTransactionsResponse
+	// entries maps an encoded ledger key to its canned result.
+	entries map[string]protocol.LedgerEntryResult
 }
 
 // Option configures a Server.
@@ -99,6 +107,7 @@ func NewServer(events []protocol.EventInfo, opts ...Option) *Server {
 		pageLimit: 100,
 		script:    map[int]Behaviour{},
 		tx:        map[string]protocol.GetTransactionResponse{},
+		entries:   map[string]protocol.LedgerEntryResult{},
 	}
 	for _, o := range opts {
 		o(s)
@@ -112,6 +121,27 @@ func NewServer(events []protocol.EventInfo, opts ...Option) *Server {
 	return s
 }
 
+// NewTransactionServer returns a fake serving the given transactions with the
+// same cursor semantics as the real getTransactions endpoint.
+func NewTransactionServer(txs []protocol.TransactionInfo, opts ...Option) *Server {
+	s := &Server{
+		transactions: txs,
+		pageLimit:    100,
+		script:       map[int]Behaviour{},
+		tx:           map[string]protocol.GetTransactionResponse{},
+	}
+	for _, o := range opts {
+		o(s)
+	}
+	if len(txs) > 0 {
+		s.latest = txs[len(txs)-1].Ledger
+		if s.oldest == 0 {
+			s.oldest = txs[0].Ledger
+		}
+	}
+	return s
+}
+
 // NewLedgerServer returns a fake serving the given ledgers.
 func NewLedgerServer(ledgers []protocol.LedgerInfo, opts ...Option) *Server {
 	s := &Server{
@@ -119,6 +149,7 @@ func NewLedgerServer(ledgers []protocol.LedgerInfo, opts ...Option) *Server {
 		pageLimit: 100,
 		script:    map[int]Behaviour{},
 		tx:        map[string]protocol.GetTransactionResponse{},
+		entries:   map[string]protocol.LedgerEntryResult{},
 	}
 	for _, o := range opts {
 		o(s)
@@ -144,6 +175,106 @@ func (s *Server) SetTransactions(resp protocol.GetTransactionsResponse) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.txs = resp
+}
+
+// SetLedgerEntries installs canned results keyed by encoded ledger key.
+func (s *Server) SetLedgerEntries(entries map[string]protocol.LedgerEntryResult) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.entries = entries
+}
+
+// SetContractWasm installs the instance and code entries for a contract whose
+// WASM bytecode is wasm. It is the fixture that lets ABI resolution be tested
+// without a network.
+func (s *Server) SetContractWasm(contractID string, wasm []byte) error {
+	entries, err := ContractWasmEntries(contractID, wasm)
+	if err != nil {
+		return err
+	}
+	s.SetLedgerEntries(entries)
+	return nil
+}
+
+// ContractWasmEntries builds the two ledger entries a contract ABI resolver
+// reads: the instance entry naming the WASM hash, and the code entry carrying
+// the bytecode.
+func ContractWasmEntries(contractID string, wasm []byte) (map[string]protocol.LedgerEntryResult, error) {
+	raw, err := strkey.Decode(strkey.VersionByteContract, contractID)
+	if err != nil {
+		return nil, fmt.Errorf("decoding contract ID: %w", err)
+	}
+	if len(raw) != len(xdr.Hash{}) {
+		return nil, fmt.Errorf("contract ID decodes to %d bytes, want %d", len(raw), len(xdr.Hash{}))
+	}
+
+	var id xdr.ContractId
+	copy(id[:], raw)
+	address := xdr.ScAddress{Type: xdr.ScAddressTypeScAddressTypeContract, ContractId: &id}
+	hash := xdr.Hash(sha256.Sum256(wasm))
+
+	instance := xdr.LedgerEntry{
+		Data: xdr.LedgerEntryData{
+			Type: xdr.LedgerEntryTypeContractData,
+			ContractData: &xdr.ContractDataEntry{
+				Contract:   address,
+				Key:        xdr.ScVal{Type: xdr.ScValTypeScvLedgerKeyContractInstance},
+				Durability: xdr.ContractDataDurabilityPersistent,
+				Val: xdr.ScVal{
+					Type: xdr.ScValTypeScvContractInstance,
+					Instance: &xdr.ScContractInstance{
+						Executable: xdr.ContractExecutable{
+							Type:     xdr.ContractExecutableTypeContractExecutableWasm,
+							WasmHash: &hash,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	code := xdr.LedgerEntry{
+		Data: xdr.LedgerEntryData{
+			Type: xdr.LedgerEntryTypeContractCode,
+			ContractCode: &xdr.ContractCodeEntry{
+				Hash: hash,
+				Code: wasm,
+			},
+		},
+	}
+
+	instanceKey := xdr.LedgerKey{
+		Type: xdr.LedgerEntryTypeContractData,
+		ContractData: &xdr.LedgerKeyContractData{
+			Contract:   address,
+			Key:        xdr.ScVal{Type: xdr.ScValTypeScvLedgerKeyContractInstance},
+			Durability: xdr.ContractDataDurabilityPersistent,
+		},
+	}
+	codeKey := xdr.LedgerKey{
+		Type:         xdr.LedgerEntryTypeContractCode,
+		ContractCode: &xdr.LedgerKeyContractCode{Hash: hash},
+	}
+
+	entries := make(map[string]protocol.LedgerEntryResult, 2)
+	for _, item := range []struct {
+		key   xdr.LedgerKey
+		entry xdr.LedgerEntry
+	}{
+		{key: instanceKey, entry: instance},
+		{key: codeKey, entry: code},
+	} {
+		keyXDR, err := xdr.MarshalBase64(item.key)
+		if err != nil {
+			return nil, fmt.Errorf("encoding ledger key: %w", err)
+		}
+		dataXDR, err := xdr.MarshalBase64(item.entry)
+		if err != nil {
+			return nil, fmt.Errorf("encoding ledger entry: %w", err)
+		}
+		entries[keyXDR] = protocol.LedgerEntryResult{KeyXDR: keyXDR, DataXDR: dataXDR}
+	}
+	return entries, nil
 }
 
 // Calls reports how many stream calls have been made, so tests can assert on
@@ -358,7 +489,90 @@ func (s *Server) GetTransactions(ctx context.Context, req protocol.GetTransactio
 	if err := ctx.Err(); err != nil {
 		return protocol.GetTransactionsResponse{}, err
 	}
-	return s.txs, nil
+	if len(s.transactions) == 0 {
+		return s.txs, nil
+	}
+
+	call := s.calls
+	s.calls++
+	b := s.script[call]
+	if b.Err != nil {
+		return protocol.GetTransactionsResponse{}, b.Err
+	}
+
+	oldest, latest := s.oldest, s.latest
+	if b.OldestLedger != 0 {
+		oldest = b.OldestLedger
+	}
+	if b.LatestLedger != 0 {
+		latest = b.LatestLedger
+	}
+
+	hasCursor := req.Pagination != nil && req.Pagination.Cursor != ""
+
+	respond := func(page []protocol.TransactionInfo) protocol.GetTransactionsResponse {
+		resp := protocol.GetTransactionsResponse{
+			Transactions: page,
+			LatestLedger: latest,
+			OldestLedger: oldest,
+		}
+		if len(page) > 0 {
+			resp.Cursor = transactionCursor(page[len(page)-1])
+		} else if hasCursor {
+			resp.Cursor = req.Pagination.Cursor
+		}
+		return resp
+	}
+
+	if b.Empty {
+		return respond(nil), nil
+	}
+
+	var out []protocol.TransactionInfo
+	for _, tx := range s.transactions {
+		if hasCursor {
+			if transactionCursor(tx) > req.Pagination.Cursor {
+				out = append(out, tx)
+			}
+			continue
+		}
+		if req.StartLedger == 0 || tx.Ledger >= req.StartLedger {
+			out = append(out, tx)
+		}
+	}
+
+	limit := s.pageLimit
+	if req.Pagination != nil && req.Pagination.Limit > 0 && int(req.Pagination.Limit) < limit {
+		limit = int(req.Pagination.Limit)
+	}
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return respond(out), nil
+}
+
+func transactionCursor(tx protocol.TransactionInfo) string {
+	return fmt.Sprintf("%010d-%06d", tx.Ledger, tx.ApplicationOrder)
+}
+
+// GetLedgerEntries implements rpc.LedgerEntriesClient.
+func (s *Server) GetLedgerEntries(ctx context.Context, req protocol.GetLedgerEntriesRequest) (protocol.GetLedgerEntriesResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return protocol.GetLedgerEntriesResponse{}, err
+	}
+
+	resp := protocol.GetLedgerEntriesResponse{LatestLedger: s.latest}
+	for _, key := range req.Keys {
+		entry, ok := s.entries[key]
+		if !ok {
+			continue
+		}
+		resp.Entries = append(resp.Entries, entry)
+	}
+	return resp, nil
 }
 
 // GetLatestLedger implements rpc.Client.
