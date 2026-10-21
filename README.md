@@ -194,6 +194,46 @@ position it reached, and a page the `--limit` cut short is not reported at all.
 This narrows the restart window from "the whole run" to "one record". It is
 not exactly-once — see [What prism guarantees](#what-prism-guarantees).
 
+### `prism transactions` — successes, failures, traps and fee bumps
+
+Every transaction is classified as it streams: `status`, the account that
+actually paid the fee, and — for a fee-bump wrapper — the wrapper and inner
+transaction details side by side. Failed transactions carry a decoded reason
+naming the failing operation.
+
+```sh
+# Only failures, with the decoded reason
+prism transactions --status failed --follow
+
+# Soroban contract executions that trapped or panicked
+prism transactions --trapped --json | jq -r '.failure.operation.summary'
+
+# Fee-bump wrappers, and who paid for them
+prism transactions --fee-bump --json | jq -r '.feeAccount'
+
+# Everything a particular account paid the fee for
+prism transactions --fee-account GBGSB... --follow
+```
+
+`--trapped` is narrower than `--status failed`: it selects only host
+functions that trapped or panicked, not malformed invocations or exceeded
+resource limits. `--fee-account` accepts a G or M address and matches the
+effective payer, so a muxed fee source resolves to its underlying account.
+
+The filters are applied after each page is fetched, so the cursor still
+advances across suppressed transactions — a filtered stream is a view of the
+transaction stream rather than a second stream that could skip history.
+
+```console
+$ prism transactions --status failed --limit 1 --json
+{"kind":"transaction","id":"0003966820-0001","ledger":3966820,"hash":"…","index":1,"successful":false,"status":"failed","feeAccount":"GBGSB…","failure":{"code":"tx_failed","summary":"The transaction was well-formed and authorised, but at least one of its operations failed.","operation":{"index":0,"type":"invoke_host_function","code":"invoke_host_function_trapped","summary":"The contract trapped: it panicked, or explicitly returned an error."}}}
+```
+
+Event streams can additionally drop re-polled duplicates with
+`--dedup-window`: a bounded ring remembers the last N event fingerprints and
+suppresses a replay without growing with traffic. It is off by default; `4096`
+covers a page with margin.
+
 ### `prism tx` — why did this transaction fail?
 Fetches a transaction and renders it through the lens explain path, pairing the
 envelope with its result so the failure is attributed to the operation that

@@ -67,6 +67,10 @@ type streamFlags struct {
 	// them empty, which is what keeps runStream generic.
 	topicPatterns []string
 	fanoutDir     string
+
+	// dedupWindow is the events-only re-poll de-duplicator window. Zero
+	// disables it.
+	dedupWindow int
 }
 
 func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
@@ -167,6 +171,9 @@ func (s *streamFlags) validate(cmd *cobra.Command) error {
 	}
 	if s.dlqFile != "" && s.output != "" && samePath(s.dlqFile, s.output) {
 		return fmt.Errorf("--dlq-file must differ from --output-file")
+	}
+	if s.dedupWindow < 0 {
+		return fmt.Errorf("--dedup-window must not be negative")
 	}
 	if err := s.validateState(cmd); err != nil {
 		return err
@@ -467,6 +474,8 @@ start the next run where the last one stopped.`,
 		`client-side topic pattern as comma-separated segments over decoded topics: "*", "**", "prefix:TEXT", "re:REGEX", or plain text with "*" and "?" globs; repeatable, up to 5`)
 	cmd.Flags().StringVar(&sf.fanoutDir, "fanout-dir", "",
 		"write each watched contract's events to its own NDJSON file in this directory, in addition to the main output")
+	cmd.Flags().IntVar(&sf.dedupWindow, "dedup-window", 0,
+		"drop re-polled duplicate events, remembering this many recent fingerprints (0 disables; 4096 covers a page with margin)")
 	sf.register(cmd, stream.DefaultPageLimit)
 	registerFlagCompletion(cmd, "type", "contract", "system", "diagnostic")
 	registerFlagCompletion(cmd, "gap-strategy", string(stream.GapFail), string(stream.GapResume))
@@ -576,6 +585,13 @@ func runStream(
 			// useful than one, and neither is worth losing.
 			err = errors.Join(err, closer.Close())
 		}()
+	}
+
+	// The de-duplicator sits between the tailer and the output shaping, so
+	// a re-polled event is suppressed for every sink downstream — including
+	// a fanout directory — without any of them knowing about it.
+	if sf.dedupWindow > 0 {
+		out = stream.NewDedupSink(out, sf.dedupWindow)
 	}
 
 	if len(sf.topicPatterns) > 0 {
