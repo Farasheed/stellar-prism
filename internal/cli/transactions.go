@@ -10,6 +10,7 @@ import (
 
 func newTransactionsCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 	var sf streamFlags
+	var memo string
 
 	cmd := &cobra.Command{
 		Use:   "transactions",
@@ -44,12 +45,14 @@ Transactions can be streamed continuously by using the --follow flag.`,
 				return stream.NewTransactionSource(client, stream.TransactionQuery{
 					StartLedger: startLedger,
 					PageLimit:   sf.pageSize,
+					Memo:        memo,
 				}), nil
 			}
 			return runStream(cmd.Context(), newSource, from, &sf, g, stdout, stderr)
 		},
 	}
 
+	cmd.Flags().StringVar(&memo, "memo", "", "include transactions whose sanitized text memo starts with this text")
 	sf.register(cmd, stream.DefaultTransactionPageLimit)
 	registerFlagCompletion(cmd, "gap-strategy", string(stream.GapFail), string(stream.GapResume))
 	return cmd

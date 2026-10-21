@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
@@ -16,6 +17,8 @@ const DefaultTransactionPageLimit = 100
 
 // TransactionQuery describes which transactions to stream.
 type TransactionQuery struct {
+	// Memo matches a prefix of the sanitized text memo; empty disables filtering.
+	Memo string
 	// StartLedger is where a fresh stream begins. Zero means start from the
 	// server's newest ledger.
 	StartLedger uint32
@@ -89,14 +92,18 @@ func (s *TransactionSource) Fetch(ctx context.Context, cursor string) (Batch, er
 		Full:       uint(len(resp.Transactions)) >= s.query.PageLimit,
 	}
 	for _, tx := range resp.Transactions {
-		batch.Records = append(batch.Records, transactionRecord(tx))
+		r := transactionRecord(tx)
+		if s.query.Memo != "" && (r.Transaction.Memo == nil || r.Transaction.Memo.Type != "text" || !strings.HasPrefix(r.Transaction.Memo.Value, s.query.Memo)) {
+			continue
+		}
+		batch.Records = append(batch.Records, r)
 	}
 	return batch, nil
 }
 
 // transactionRecord converts an RPC transaction into a neutral Record.
 func transactionRecord(tx protocol.TransactionInfo) Record {
-	return Record{
+	r := Record{
 		ID:       fmt.Sprintf("%010d-%04d", tx.Ledger, tx.ApplicationOrder),
 		Sequence: tx.Ledger,
 		Time:     time.Unix(tx.LedgerCloseTime, 0).UTC(),
@@ -110,4 +117,10 @@ func transactionRecord(tx protocol.TransactionInfo) Record {
 			ResultMetaXDR: tx.ResultMetaXDR,
 		},
 	}
+	if memo, err := DecodeMemo(tx.EnvelopeXDR); err == nil {
+		r.Transaction.Memo = &memo
+	} else {
+		r.Transaction.MemoError = err.Error()
+	}
+	return r
 }

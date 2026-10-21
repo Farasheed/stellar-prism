@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 
 	"github.com/stellar-optics/stellar-xdr-lens/pkg/lens"
@@ -160,6 +161,27 @@ func (h *Human) emitLedger(r stream.Record) error {
 	if _, err := h.w.WriteString(b.String()); err != nil {
 		return fmt.Errorf("human: write: %w", err)
 	}
+	if c.Consensus != nil {
+		m := c.Consensus
+		if _, err := fmt.Fprintf(h.w, "  consensus: signers=%v signature=%t quorum-data=%t\n", m.ValueSigners, m.SignaturePresent, m.QuorumDataAvailable); err != nil {
+			return err
+		}
+		if m.CloseDeltaSeconds != nil {
+			if _, err := fmt.Fprintf(h.w, "  close delta: %ds\n", *m.CloseDeltaSeconds); err != nil {
+				return err
+			}
+		}
+		for _, warning := range m.Warnings {
+			if _, err := fmt.Fprintf(h.w, "  warning: %s\n", stream.SanitizeText(warning)); err != nil {
+				return err
+			}
+		}
+		if m.Error != "" {
+			if _, err := fmt.Fprintf(h.w, "  consensus error: %s\n", stream.SanitizeText(m.Error)); err != nil {
+				return err
+			}
+		}
+	}
 	if h.compact || c.MetadataXDR == "" {
 		return nil
 	}
@@ -186,6 +208,15 @@ func (h *Human) emitTransaction(r stream.Record) error {
 
 	if _, err := h.w.WriteString(b.String()); err != nil {
 		return fmt.Errorf("human: write: %w", err)
+	}
+	memo, memoErr := stream.DecodeMemo(t.EnvelopeXDR)
+	if memoErr != nil && t.Memo != nil {
+		memo = *t.Memo
+	}
+	if memo.Type != "" {
+		if _, err := fmt.Fprintf(h.w, "  memo %s: %s\n", memo.Type, stream.HumanMemo(memo)); err != nil {
+			return err
+		}
 	}
 	if h.compact {
 		return nil
@@ -328,6 +359,7 @@ func (h *Human) writePayload(label, payload string) error {
 		return nil
 	}
 
+	sanitizeHumanNode(value.Node)
 	var buf bytes.Buffer
 	if err := h.tree.Format(&buf, value); err != nil {
 		return fmt.Errorf("human: formatting payload: %w", err)
@@ -360,4 +392,31 @@ func shorten(s string) string {
 		return s
 	}
 	return s[:5] + "…" + s[len(s)-4:]
+}
+
+// Sanitize untrusted node values before the formatter adds its own trusted
+// terminal colors and tree glyphs.
+func sanitizeHumanNode(n *lens.Node) {
+	if n == nil {
+		return
+	}
+	terminalText := func(s string) string {
+		var b strings.Builder
+		for _, r := range stream.SanitizeText(s) {
+			if r > 126 {
+				q := strconv.QuoteRuneToASCII(r)
+				b.WriteString(q[1 : len(q)-1])
+			} else {
+				b.WriteRune(r)
+			}
+		}
+		return b.String()
+	}
+	if s, ok := n.Value.(string); ok {
+		n.Value = terminalText(s)
+	}
+	n.Note = terminalText(n.Note)
+	for _, child := range n.Children {
+		sanitizeHumanNode(child)
+	}
 }

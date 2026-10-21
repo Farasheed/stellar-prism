@@ -265,3 +265,79 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+### Safe transaction memos
+
+`prism transactions --memo 'invoice:' --follow --json` selects transactions
+whose **sanitized text memo starts with** `invoice:` (an exact memo also matches).
+Filtering is local and preserves RPC pagination, including pages with no matches.
+Memo IDs are decimal strings; hash and return memos are lowercase hex strings.
+The `memo` object has `type` (`none`, `text`, `id`, `hash`, or `return`) and `value`.
+Malformed envelopes retain their original XDR and report `memoError`.
+
+Control characters, invalid UTF-8, and invisible Unicode formatting characters
+are removed from decoded memo text. Terminal output escapes non-ASCII memo
+characters. Both compact summaries and decoded payloads are protected. Original
+base64 XDR is preserved for archival use.
+
+### Ledger consensus diagnostics
+
+```sh
+prism ledgers --consensus --follow --compact
+prism ledgers --consensus --expected-validator G... --follow --json
+```
+
+Consensus output includes the SCP value's close time, transaction-set hash,
+value type, observed value signer, signature presence, and the close delta in
+seconds between consecutive ledgers. Deltas over 10 seconds and absent expected
+value signers produce warnings. The first ledger, gaps, and rewinds have no delta;
+consensus diagnostics require sequential backfill (`--backfill-workers 1`).
+Malformed headers produce a structured `consensus.error` without stopping the
+stream. JSON sinks include these metrics under `consensus`, even with `--raw`.
+
+**Header coverage:** `LedgerHeaderHistoryEntry` contains a signed Stellar value,
+not the SCP envelopes, quorum-set hashes, or complete validator signatures.
+`valueSigners` identifies value-signing evidence only; signatures are not
+cryptographically verified. `quorumDataAvailable` is always false. An expected
+validator warning means its value signature was not observed in this header;
+it does not establish that the validator was offline. Full quorum health requires
+an additional SCP history/live SCP data source.
+
+### HTTP broadcasts
+
+```sh
+prism events --contract CDLZF... --follow --serve-sse 127.0.0.1:8080
+prism serve --sse 127.0.0.1:8080 --ws 127.0.0.1:8081
+curl -N http://127.0.0.1:8080/events
+```
+
+`serve` follows contract events by default and accepts the same contract/topic,
+RPC, cursor, and output flags as `events`. `--serve-sse` (alias `--sse`) and `--ws`
+are also available on other streaming commands. Each listener broadcasts records
+in the existing raw NDJSON shape; local terminal/file output remains available.
+Listeners stop when the stream ends, reaches `--limit`, or receives SIGINT/SIGTERM.
+Use `--follow` for a persistent listener on commands other than `serve`.
+
+SSE serves `/events`, with `id:` set to the record cursor and one JSON object in
+`data:`. It sends comment pings every 15 seconds. A reconnect with
+`Last-Event-ID` replays later records from the latest 1024 records held in memory,
+then atomically joins live delivery. Unknown or expired IDs receive HTTP 409;
+clients must explicitly restart from a suitable RPC ledger when replay expires.
+Replay is shared by clients and does not survive process restarts. A fresh
+connection without `Last-Event-ID` receives future records only.
+
+WebSockets serve `/events` and `/ws`. Connections initially receive all records.
+Send `{"subscribe":"contract","id":"CDLZF..."}` to restrict a connection to
+that contract, or `{"subscribe":"topic","id":"AAAAAQ=="}` to match an exact
+base64 XDR topic segment. Successful requests receive
+`{"subscribed":"contract","id":"CDLZF..."}`; invalid requests receive an
+`error` object. Subscriptions are additive (up to 128 per connection); contracts
+are ORed, topics are ORed, and the two categories are ANDed. Reconnect to reset
+subscriptions. WebSockets send periodic protocol pings and use the library's
+same-origin browser policy.
+
+Each client has a bounded queue. Slow clients disconnect rather than blocking
+RPC polling or other clients. SSE clients can reconnect using retained history;
+WebSocket delivery is live only. Write deadlines and shutdown cleanup release
+stalled connections. These listeners provide no authentication or TLS; choose
+the bind address explicitly and use a reverse proxy when needed.
