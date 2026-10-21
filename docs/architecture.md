@@ -75,6 +75,10 @@ pkg/stream/
   dedup.go            bounded ring-buffer de-duplication for re-polls
   storage_changes.go  contract storage mutations (from tx meta)
   wasm_events.go      WASM uploads and contract deployments
+  operations.go        operation-level transaction demux
+  footprint.go         same-ledger Soroban footprint conflicts
+  simulate.go          live transaction simulation estimates
+  reorder.go            intra-ledger response reordering buffer
   pool.go             multi-endpoint failover RPC client
   drainer.go          concurrent historical backfill + ordered merge
   batcher.go          count/time batching sink wrapper
@@ -450,6 +454,28 @@ Both sources synthesise fixed-width zero-padded IDs (`%010d-%06d-…`) from
 the ledger sequence, preserving the lexicographic-order contract the tailer
 depends on.
 
+### Operation streams (`prism operations`)
+
+`OperationSource` decodes each transaction envelope and emits one record per
+operation with the deterministic ID `%010d-%04d-%02d`. It carries the operation
+type, effective source account, operation-body XDR and matching operation
+result, and supports type and source-account filters.
+
+### Footprint conflicts (`--detect-conflicts`)
+
+The tailer's reorder buffer closes a ledger before `FootprintAnalyzer` examines
+its Soroban transaction footprints. A key is reported when transactions share
+it and at least one access is read-write. The same conflict is attached to
+each participating transaction, allowing both human warnings and structured
+NDJSON consumers to identify hot keys and transaction sets.
+
+### Simulation streams (`prism simulate`)
+
+`SimulationSource` polls the latest ledger, calls `simulateTransaction` once
+for each newly observed head, decodes Soroban resource estimates, and compares
+successive return values through stellar-xdr-lens before emitting changed
+fields.
+
 ### Transaction classification (`prism transactions`)
 
 `TransactionSource` accepts `TransactionQuery.Classify`, which fills four
@@ -516,7 +542,12 @@ The pieces:
 | `stream.DrainerConfig.OnPage` | how a concurrent backfill reports a delivered page |
 
 **The checkpoint is written after the emit, not before.** `Options.OnPage`
-fires once a page has been delivered in full. A page cut short by `--limit`,
+fires once a page has been delivered in full. Pages held in the ledger reorder
+buffer delay their checkpoints, including subsequent empty filtered pages;
+`Tailer.Cursor()` returns the delivered position, not the ahead-of-output fetch
+cursor. A bounded follow drains its buffered suffix when the available pages
+are exhausted and enough records are available to satisfy `--limit`, without
+waiting for another ledger. A page cut short by `--limit`,
 or one the sink rejected, produces no checkpoint, so a recorded position can
 never point past records that were not delivered. The callback also skips a
 page that returned nothing and left the cursor where it was: that says
@@ -788,7 +819,7 @@ rendered in Soroban type syntax, and `--function` plus repeated `--arg` decodes
 actual base64 `ScVal` values through lens against the named parameters.
 
 `getLedgerEntries` is an optional capability (`rpc.LedgerEntriesClient`), not
-part of the streaming `rpc.Client` interface. That keeps the four-method core
+part of the streaming `rpc.Client` interface. That keeps the core interface
 small and avoids forcing stream-only fakes to implement a method they never
 use. Only the `abi` command takes this path; every streaming command remains
 independent of it.
@@ -844,9 +875,123 @@ rather than reaching for `xdr` directly, so output stays consistent with the
 rest of the family — and report an undecodable payload inline rather than
 returning an error, so one malformed value cannot kill a long-running tail.
 
+### Built-in sinks
+
+Every streaming command accepts the same optional output flags. They are off
+unless set, so the default path still touches nothing but RPC and stdout. When
+one or more are enabled, `pkg/sink.Fanout` delivers each record to the normal
+output first and then to each extra sink in order; the first failure ends the
+stream rather than silently dropping records. `Close` flushes buffered
+batches, stops timers and closes listeners and sockets, so a finished stream
+leaves nothing running.
+
+All extra sinks reuse `sink.MarshalRecord`, so the JSON object is byte-for-byte
+what `--json` writes to stdout. With `--raw` the base64 XDR fields are kept
+instead of decoded values.
+
+#### Webhook (`--webhook-url`, `pkg/sink/webhook.go`)
+
+Batches records into one request body:
+
+```json
+{"delivery":"1700000123456789-1","sentAt":"2023-11-14T22:15:23Z",
+ "records":[{"kind":"event","id":"..."}]}
+```
+
+Headers: `Content-Type: application/json`, `X-Prism-Delivery` (the idempotency
+key), `X-Prism-Timestamp` (Unix seconds) and, when a secret is configured,
+`X-Prism-Signature: sha256=<hex>`. The signature is
+`HMAC-SHA256(secret, "<timestamp>.<body>")`; receivers must verify it before
+trusting a payload. The secret comes from `--webhook-secret` or
+`PRISM_WEBHOOK_SECRET`.
+
+Batching flushes at `--webhook-batch-size` records or `--webhook-timeout`
+after the first buffered record, and on exit. Failures retry with exponential
+backoff from 100ms to 5s, ±20% jitter, honouring `Retry-After`; a 4xx other
+than 408/425/429 is treated as permanent. A failed batch stays buffered, so a
+later flush or close retries it: delivery is at-least-once, not exactly-once.
+
+#### Object storage (`--cloud-*`, `pkg/sink/cloud_storage.go`)
+
+Records are accumulated in memory and uploaded as one object when the chunk
+reaches `--cloud-batch-records`, `--cloud-batch-bytes`, or
+`--cloud-batch-timeout`. The key is derived only from the records:
+
+```
+<prefix>/<YYYY>/<MM>/<DD>/ledger-<start>-<end>/<firstID>-<lastID>.ndjson[.gz]
+```
+
+A retry therefore overwrites the same object instead of duplicating a chunk,
+and a backfill lands in the partition of the ledger's close date rather than
+the upload date. `--cloud-compress` (default on) gzips the body and sets
+`application/gzip`; otherwise it is `application/x-ndjson`. One record larger
+than the byte cap is uploaded alone rather than split.
+
+The `ObjectStore` interface is the seam, so chunking is tested with an
+in-memory store and no network:
+
+- **S3** (`pkg/sink/s3.go`): SigV4-signed `PUT` using
+  `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and optional
+  `AWS_SESSION_TOKEN`. Path-style addressing by default, `--cloud-region`
+  defaults to `us-east-1`. The signer is checked against AWS's published PUT
+  example in the unit tests.
+- **GCS** (`pkg/sink/gcs.go`): the JSON API's simple media upload (`POST
+  /upload/storage/v1/b/<bucket>/o?uploadType=media&name=<key>`) with a bearer
+  token from `GOOGLE_OAUTH_ACCESS_TOKEN`.
+
+Uploads retry like the webhook and keep the chunk buffered on failure.
+
+#### Prometheus (`--metrics-addr`, `pkg/sink/prometheus.go`)
+
+Serves `/metrics` on the configured address with:
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `prism_records_total{kind}` | counter | records emitted |
+| `prism_events_total{type}` | counter | Soroban events by type |
+| `prism_errors_total{stage}` | counter | `rpc` retries, `gap` recoveries, `sink` failures |
+| `prism_ledger_latency_seconds` | histogram | ledger close to emission, default buckets |
+| `prism_ledger_sequence` | gauge | highest ledger emitted |
+
+The exposition text is rendered directly rather than through the Prometheus
+client, keeping the CLI dependency-free. The server binds before the stream
+starts; `:0` chooses a port, which the CLI prints on stderr. Shutdown waits for
+in-flight scrapes and leaves no goroutine behind.
+
+#### Syslog and journald (`--syslog-address`, `pkg/sink/syslog.go`)
+
+`--syslog-format rfc5424` writes one newline-terminated message per record:
+
+```
+<134>1 2023-11-14T22:15:23.000Z host prism - event [prism@32473 kind="event" ledger="100" id="..."] {"kind":"event",...}
+```
+
+Severity follows the record: failed transactions and deployments are warnings
+(4), diagnostic events are debug (7), everything else is informational (6).
+Structured-data values escape `\`, `"` and `]` per RFC 5424.
+
+`--syslog-format journald` writes the journald native protocol instead: a
+`NAME=value` block with `PRIORITY`, `SYSLOG_IDENTIFIER`, `SYSLOG_FACILITY`,
+`PRISM_KIND`, `PRISM_LEDGER`, `PRISM_RECORD_ID`, `PRISM_LEDGER_TIME` and
+`MESSAGE`, terminated by a blank line. Use `unixgram:///run/systemd/journal/socket`
+as the address. `DialSyslog` also accepts `unix://`, `udp://`, `tcp://` and a
+bare socket path; `--syslog-facility` accepts any POSIX facility name and
+defaults to `local0`.
+
+#### Configuration rules
+
+Secrets are read from the environment wherever possible, because command-line
+flags are visible in process listings. `--webhook-secret` exists for trusted
+shells; the cloud adapters only read credentials from the environment.
+
+`--batch` composes with these sinks: the batcher wraps the fanout, so stdout
+and every destination receive whole batches. The webhook and cloud sinks also
+cap their own in-memory batches, so a large stream cannot grow memory without
+bound even when `--batch` is not used.
+
 ## Adding an RPC method
 
-`pkg/rpc.Client` has five methods. Every one added must also be implemented in
+`pkg/rpc.Client` has a small set of methods. Every one added must also be implemented in
 `internal/fakerpc`, so prefer composing the existing calls. The interface is
 small on purpose: it is the boundary that keeps the entire streaming core
 testable without a network.

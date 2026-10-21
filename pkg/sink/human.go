@@ -122,11 +122,78 @@ func (h *Human) emitRecord(r stream.Record) error {
 		if _, err := h.w.WriteString("\n"); err != nil {
 			return fmt.Errorf("human: write: %w", err)
 		}
+	case stream.KindOperation:
+		if err := h.emitOperation(r); err != nil {
+			return err
+		}
+	case stream.KindSimulation:
+		if err := h.emitSimulation(r); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("human: unknown record kind %q", r.Kind)
 	}
 
 	return nil
+}
+
+func (h *Human) emitOperation(r stream.Record) error {
+	op := r.Operation
+	if op == nil {
+		return fmt.Errorf("human: operation record %s has no payload", r.ID)
+	}
+	p := h.palette
+	if _, err := fmt.Fprintf(h.w, "%s%s%s  %sledger %d%s  %soperation %s%s  %s%s%s\n",
+		p.Note, formatTime(r.Time), p.Reset, p.Dim, r.Sequence, p.Reset,
+		p.Type, op.Type, p.Reset, p.Key, op.SourceAccount, p.Reset); err != nil {
+		return fmt.Errorf("human: write: %w", err)
+	}
+	if h.compact {
+		return nil
+	}
+	if op.ParametersXDR != "" {
+		if err := h.writePayload("parameters", op.ParametersXDR); err != nil {
+			return err
+		}
+	}
+	if op.ResultCode != "" {
+		if _, err := fmt.Fprintf(h.w, "  %sresult %s%s\n", p.Key, op.ResultCode, p.Reset); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
+	}
+	if op.ResultXDR != "" {
+		return h.writePayload("result", op.ResultXDR)
+	}
+	return nil
+}
+
+func (h *Human) emitSimulation(r stream.Record) error {
+	sim := r.Simulation
+	if sim == nil {
+		return fmt.Errorf("human: simulation record %s has no payload", r.ID)
+	}
+	p := h.palette
+	if _, err := fmt.Fprintf(h.w, "%sledger %d%s  %ssimulation%s  instructions %d  disk-read %d  write %d  min-fee %d",
+		p.Note, sim.Ledger, p.Reset, p.Type, p.Reset, sim.Instructions, sim.DiskReadBytes, sim.WriteBytes, sim.MinResourceFee); err != nil {
+		return fmt.Errorf("human: write: %w", err)
+	}
+	if sim.Error != "" {
+		if _, err := fmt.Fprintf(h.w, "  %s%s%s", p.Remove, sim.Error, p.Reset); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
+	}
+	if len(sim.Changed) > 0 {
+		if _, err := fmt.Fprintf(h.w, "  %schanged %s%s", p.Key, strings.Join(sim.Changed, ","), p.Reset); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
+	}
+	if _, err := h.w.WriteString("\n"); err != nil {
+		return fmt.Errorf("human: write: %w", err)
+	}
+	if h.compact || sim.ReturnValueXDR == "" {
+		return nil
+	}
+	return h.writePayload("return", sim.ReturnValueXDR)
 }
 
 func (h *Human) emitEvent(r stream.Record) error {
@@ -137,6 +204,12 @@ func (h *Human) emitEvent(r stream.Record) error {
 	}
 
 	var b strings.Builder
+	indent := ""
+	if e.CallDepth > 0 {
+		indent = strings.Repeat("   ", e.CallDepth-1)
+		fmt.Fprintf(&b, "%s└─ [call %d] ", indent, e.CallDepth)
+		indent += "   "
+	}
 	fmt.Fprintf(&b, "%s%s%s  %sledger %d%s  %s%s%s",
 		p.Note, formatTime(r.Time), p.Reset,
 		p.Dim, r.Sequence, p.Reset,
@@ -144,6 +217,9 @@ func (h *Human) emitEvent(r stream.Record) error {
 	)
 	if e.ContractID != "" {
 		fmt.Fprintf(&b, "  %s%s%s", p.Key, shorten(e.ContractID), p.Reset)
+	}
+	if e.ParentContractID != "" {
+		fmt.Fprintf(&b, "  %sfrom %s%s", p.Dim, shorten(e.ParentContractID), p.Reset)
 	}
 	if e.TxHash != "" {
 		fmt.Fprintf(&b, "  %stx %s%s", p.Dim, shorten(e.TxHash), p.Reset)
@@ -158,12 +234,12 @@ func (h *Human) emitEvent(r stream.Record) error {
 	}
 
 	for i, t := range e.TopicXDR {
-		if err := h.writePayload(fmt.Sprintf("topic[%d]", i), t); err != nil {
+		if err := h.writePayload(fmt.Sprintf("%stopic[%d]", indent, i), t); err != nil {
 			return err
 		}
 	}
 	if e.ValueXDR != "" {
-		if err := h.writePayload("value", e.ValueXDR); err != nil {
+		if err := h.writePayload(indent+"value", e.ValueXDR); err != nil {
 			return err
 		}
 	}
@@ -254,6 +330,12 @@ func (h *Human) emitTransaction(r stream.Record) error {
 
 	if _, err := h.w.WriteString(b.String()); err != nil {
 		return fmt.Errorf("human: write: %w", err)
+	}
+	for _, conflict := range t.Conflicts {
+		if _, err := fmt.Fprintf(h.w, "  %sconflict%s  key %s  transactions %s\n",
+			p.Remove, p.Reset, shorten(conflict.KeyXDR), strings.Join(conflict.Transactions, ", ")); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
 	}
 	memo, memoErr := stream.DecodeMemo(t.EnvelopeXDR)
 	if memoErr != nil && t.Memo != nil {
