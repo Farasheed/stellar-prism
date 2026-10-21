@@ -206,12 +206,59 @@ func TestStateFlagsRequireAStateFile(t *testing.T) {
 		{name: "prune interval", args: []string{"events", "--from", "100", "--prune-interval", "1s"}},
 		{name: "prune max age", args: []string{"events", "--from", "100", "--prune-max-age", "1h"}},
 		{name: "negative keep", args: []string{"events", "--from", "100", "--state-file", "cursor.jsonl", "--prune-keep", "-1"}},
+		{name: "negative interval", args: []string{"events", "--from", "100", "--state-file", "cursor.jsonl", "--prune-interval", "-1s"}},
+		{name: "negative max age", args: []string{"events", "--from", "100", "--state-file", "cursor.jsonl", "--prune-max-age", "-1h"}},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, _, err := run(t, tc.args...); err == nil {
 				t.Fatal("Execute() error = nil, want a validation failure")
+			}
+		})
+	}
+}
+
+// TestStateFlagsRejectNegativeValues checks that a negative limit is refused
+// with a message that names the flag.
+//
+// A negative interval or age is not a limit the pruner can honour: it would
+// compact on every pass, or drop every checkpoint. Refusing it at the command
+// line is clearer than quietly reading it as "disabled".
+func TestStateFlagsRejectNegativeValues(t *testing.T) {
+	srv := fakerpc.NewServer(fakerpc.MakeEvents(100, 1), fakerpc.WithPageLimit(10))
+	withFake(t, srv)
+
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "interval",
+			args: []string{"events", "--from", "100", "--state-file", "cursor.jsonl", "--prune-interval", "-1s"},
+			want: "--prune-interval",
+		},
+		{
+			name: "max age",
+			args: []string{"events", "--from", "100", "--state-file", "cursor.jsonl", "--prune-max-age", "-1h"},
+			want: "--prune-max-age",
+		},
+		{
+			name: "keep",
+			args: []string{"events", "--from", "100", "--state-file", "cursor.jsonl", "--prune-keep", "-1"},
+			want: "--prune-keep",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := run(t, tc.args...)
+			if err == nil {
+				t.Fatal("Execute() error = nil, want a validation failure")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("Execute() error = %q, want it to name %s", err, tc.want)
 			}
 		})
 	}

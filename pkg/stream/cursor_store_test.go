@@ -119,6 +119,136 @@ func TestFileMetadataStoreLatestOnAMissingKey(t *testing.T) {
 	}
 }
 
+// TestFileMetadataStoreEntriesOnAMissingFile checks that a journal that has
+// not been written yet holds no entries, rather than being an error.
+//
+// A stream that has not delivered a page has nothing to resume from, and the
+// caller should not have to distinguish "no file" from "no entries".
+func TestFileMetadataStoreEntriesOnAMissingFile(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore(t)
+	entries, err := store.Entries(context.Background(), "events")
+	if err != nil {
+		t.Fatalf("Entries() error = %v, want a missing file to be empty rather than an error", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("got %d entries, want 0", len(entries))
+	}
+}
+
+// TestFileMetadataStoreLatestFailsWhenTheFileCannotBeRead checks that a
+// journal that cannot be read is reported, not silently treated as empty.
+//
+// The difference matters: an unreadable journal means the operator's resume
+// point is unknown, and starting from the wrong place is worse than failing.
+func TestFileMetadataStoreLatestFailsWhenTheFileCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cursor.jsonl")
+	store, err := stream.NewFileMetadataStore(path)
+	if err != nil {
+		t.Fatalf("NewFileMetadataStore() error = %v", err)
+	}
+	appendCheckpoint(t, store, "events", "a", time.Unix(1700000000, 0).UTC())
+
+	// Replace the journal with a directory, which cannot be read as a file.
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("removing the file: %v", err)
+	}
+	if err := os.Mkdir(path, 0o750); err != nil {
+		t.Fatalf("creating the directory: %v", err)
+	}
+
+	if _, _, err := store.Latest(context.Background(), "events"); err == nil {
+		t.Fatal("Latest() error = nil, want the read failure to be reported")
+	}
+}
+
+// TestFileMetadataStorePruneSkipsBlankLines checks that a journal padded
+// with blank lines is compacted without complaint.
+//
+// A crashed writer can leave a blank line behind, and the pruner must not
+// treat that as corruption or let it stop the compaction.
+func TestFileMetadataStorePruneSkipsBlankLines(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore(t)
+	now := time.Unix(1700000000, 0).UTC()
+	appendCheckpoint(t, store, "events", "a", now)
+	appendCheckpoint(t, store, "events", "b", now)
+
+	// Pad the journal with blank and whitespace-only lines.
+	path := store.Path()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading the journal: %v", err)
+	}
+	padded := "\n   \n" + string(body) + "\n\t\n"
+	if err := os.WriteFile(path, []byte(padded), 0o600); err != nil {
+		t.Fatalf("writing the padded journal: %v", err)
+	}
+
+	stats, err := store.Prune(context.Background(), stream.PrunePolicy{Keep: 1})
+	if err != nil {
+		t.Fatalf("Prune() error = %v", err)
+	}
+	if stats.Kept != 1 {
+		t.Errorf("Prune() kept = %d, want 1", stats.Kept)
+	}
+
+	entries, err := store.Entries(context.Background(), "events")
+	if err != nil {
+		t.Fatalf("Entries() error = %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("got %d entries, want 1", len(entries))
+	}
+	if entries[0].Cursor != "b" {
+		t.Errorf("kept the %q cursor, want the newest one (%q)", entries[0].Cursor, "b")
+	}
+
+	// The compacted journal must hold no blank lines at all: exactly one
+	// entry, and nothing else but the trailing newline.
+	compacted, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading the compacted journal: %v", err)
+	}
+	lines := strings.Split(strings.TrimSuffix(string(compacted), "\n"), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("the compacted journal holds %d lines, want 1:\n%q", len(lines), string(compacted))
+	}
+	if strings.TrimSpace(lines[0]) == "" {
+		t.Errorf("the compacted journal holds a blank line:\n%q", string(compacted))
+	}
+}
+
+// TestFileMetadataStoreAppendFailsWhenThePathIsADirectory checks that a
+// journal that cannot be written is reported.
+func TestFileMetadataStoreAppendFailsWhenThePathIsADirectory(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cursor.jsonl")
+	store, err := stream.NewFileMetadataStore(path)
+	if err != nil {
+		t.Fatalf("NewFileMetadataStore() error = %v", err)
+	}
+	if err := os.Mkdir(path, 0o750); err != nil {
+		t.Fatalf("creating the directory: %v", err)
+	}
+
+	err = store.Append(context.Background(), stream.CursorMetadata{
+		Key:        "events",
+		Cursor:     "a",
+		RecordedAt: time.Unix(1700000000, 0).UTC(),
+	})
+	if err == nil {
+		t.Fatal("Append() error = nil, want the write failure to be reported")
+	}
+}
+
 func TestFileMetadataStoreEntriesFiltersByKey(t *testing.T) {
 	t.Parallel()
 
@@ -346,6 +476,51 @@ func TestFileMetadataStoreAppendFailsWhenTheDirectoryIsGone(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "cursor metadata file") {
 		t.Errorf("Append() error = %q, want it to name the file", err)
+	}
+}
+
+// TestFileMetadataStorePruneFailsWhenTheDirectoryIsNotWritable checks that a
+// read-only directory is reported rather than silently skipped.
+//
+// A read-only mount is the likeliest reason a compaction cannot run, and the
+// operator needs to hear about it: a journal that quietly stops being
+// compacted is how it grows without bound.
+func TestFileMetadataStorePruneFailsWhenTheDirectoryIsNotWritable(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cursor.jsonl")
+	store, err := stream.NewFileMetadataStore(path)
+	if err != nil {
+		t.Fatalf("NewFileMetadataStore() error = %v", err)
+	}
+	appendCheckpoint(t, store, "events", "a", time.Unix(1700000000, 0).UTC())
+
+	// The temporary file the rewrite needs is created in the same directory,
+	// so a read-only directory is what stops it.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("making the directory read-only: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(dir, 0o700)
+	})
+
+	_, err = store.Prune(context.Background(), stream.PrunePolicy{Keep: 1})
+	if err == nil {
+		t.Fatal("Prune() error = nil, want the compaction failure to be reported")
+	}
+	if !strings.Contains(err.Error(), "temporary cursor metadata file") {
+		t.Errorf("Prune() error = %q, want it to name the temporary file", err)
+	}
+
+	// The journal must be left intact: a failed compaction is not a reason to
+	// lose the recorded position.
+	entries, err := store.Entries(context.Background(), "events")
+	if err != nil {
+		t.Fatalf("Entries() error = %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("got %d entries, want the failed compaction to leave the journal intact", len(entries))
 	}
 }
 
