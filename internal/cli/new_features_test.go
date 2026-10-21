@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -57,5 +58,43 @@ func TestSimulateCommandNDJSON(t *testing.T) {
 func TestSimulateCommandRequiresEnvelope(t *testing.T) {
 	if _, _, err := run(t, "simulate"); err == nil || !strings.Contains(err.Error(), "--tx-envelope") {
 		t.Fatalf("Execute() error = %v, want missing envelope validation", err)
+	}
+}
+
+func TestNewStreamsValidateSinceFlags(t *testing.T) {
+	for _, args := range [][]string{
+		{"operations", "--from", "1", "--since", "1h"},
+		{"simulate", "--tx-envelope", "AAA=", "--from", "1", "--since", "1h"},
+	} {
+		if _, _, err := run(t, args...); err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+			t.Errorf("%v: error = %v, want mutually exclusive flags", args, err)
+		}
+	}
+}
+
+func TestOperationsResumesWithFilterSpecificState(t *testing.T) {
+	envelope := cliUploadEnvelope(t, []byte{0, 97, 115, 109})
+	transaction := func(ledger uint32) protocol.TransactionInfo {
+		return cliTransaction(ledger, "tx", protocol.TransactionStatusSuccess, envelope, "")
+	}
+	withFake(t, fakerpc.NewTransactionServer([]protocol.TransactionInfo{transaction(9900)}))
+	path := filepath.Join(t.TempDir(), "cursor.jsonl")
+	args := []string{"operations", "--type", "invoke_host_function", "--json", "--state-file", path}
+	if _, _, err := run(t, append(args, "--from", "9900")...); err != nil {
+		t.Fatal(err)
+	}
+	entries := stateEntries(t, path, "operations|type=invoke_host_function")
+	if len(entries) != 1 {
+		t.Fatalf("got %d operation checkpoints, want 1", len(entries))
+	}
+	withFake(t, fakerpc.NewTransactionServer([]protocol.TransactionInfo{
+		transaction(9900), transaction(9901), transaction(9902),
+	}))
+	stdout, _, err := run(t, append(args, "--resume")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(nonEmptyLines(stdout)); got != 2 {
+		t.Fatalf("resumed %d records, want both unseen ledgers: %s", got, stdout)
 	}
 }

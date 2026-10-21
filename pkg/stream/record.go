@@ -89,6 +89,8 @@ type Event struct {
 
 // LedgerClose is ledger close metadata as delivered by RPC.
 type LedgerClose struct {
+	// Consensus is populated when consensus diagnostics are requested.
+	Consensus *ConsensusMetrics
 	// Hash is the hex ledger hash.
 	Hash string
 	// HeaderXDR is the base64 LedgerHeaderHistoryEntry.
@@ -99,6 +101,10 @@ type LedgerClose struct {
 
 // Transaction is a transaction as delivered by RPC.
 type Transaction struct {
+	// Memo is decoded and sanitized when the envelope is valid.
+	Memo *SanitizedMemo
+	// MemoError describes a malformed envelope without aborting the stream.
+	MemoError string
 	// Hash is the hex transaction hash.
 	Hash string
 	// Index is the zero-based index of the transaction within its ledger.
@@ -113,6 +119,20 @@ type Transaction struct {
 	ResultMetaXDR string
 	// Conflicts contains Soroban footprint collisions detected in this ledger.
 	Conflicts []FootprintConflict
+
+	// Status is "success" or "failed" once the transaction has been
+	// classified. It is empty on a record produced without
+	// TransactionQuery.Classify, which is what the derived sources use.
+	Status string
+	// FeeAccount is the strkey account that paid the fee: the fee-bump
+	// source for a wrapped transaction, and the transaction's own source
+	// otherwise. It is set during classification.
+	FeeAccount string
+	// FeeBump is set when the transaction envelope is a FeeBumpTransaction.
+	FeeBump *FeeBump
+	// Failure explains a failed transaction's decoded result. It is nil for
+	// a successful transaction and for an unclassified record.
+	Failure *Failure
 }
 
 // StorageChange is a single contract-related ledger entry mutation extracted

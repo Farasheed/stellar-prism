@@ -34,10 +34,14 @@ func (b *ReorderBuffer) Add(records []Record) []Record {
 		}
 	}
 	for _, r := range records {
-		if _, ok := b.seen[r.ID]; ok {
-			continue
+		// An absent ID cannot identify a replay. Leave content-based
+		// deduplication to downstream sinks in that case.
+		if r.ID != "" {
+			if _, ok := b.seen[r.ID]; ok {
+				continue
+			}
+			b.seen[r.ID] = struct{}{}
 		}
-		b.seen[r.ID] = struct{}{}
 		b.pending = append(b.pending, r)
 		if !haveLedger || r.Sequence > maxLedger {
 			maxLedger = r.Sequence

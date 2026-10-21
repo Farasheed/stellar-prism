@@ -2,8 +2,8 @@
 // and an adapter over the Stellar SDK client that implements it.
 //
 // The Client interface exists so the streaming state machine can be tested
-// without a network. Everything prism does against RPC goes through these
-// a small set of methods, which keeps the fake in internal/fakerpc small
+// without a network. Everything the streaming core does against RPC goes
+// through this interface, which keeps the fake in internal/fakerpc small
 // enough to reason about.
 package rpc
 
@@ -184,6 +184,16 @@ func (c *SDKClient) GetLatestLedger(ctx context.Context) (protocol.GetLatestLedg
 	resp, err := c.inner.GetLatestLedger(ctx)
 	if err != nil {
 		return resp, fmt.Errorf("rpc getLatestLedger: %w", err)
+	}
+	return resp, nil
+}
+
+// GetHealth implements HealthClient. It is intentionally not part of the
+// streaming Client interface; only the health command needs it.
+func (c *SDKClient) GetHealth(ctx context.Context) (protocol.GetHealthResponse, error) {
+	resp, err := c.inner.GetHealth(ctx)
+	if err != nil {
+		return resp, fmt.Errorf("rpc getHealth: %w", err)
 	}
 	return resp, nil
 }

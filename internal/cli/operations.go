@@ -26,7 +26,7 @@ watching new ledgers.`,
   prism operations --source-account G... --json`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := sf.validate(); err != nil {
+			if err := sf.validate(cmd); err != nil {
 				return err
 			}
 			client, closeClient, err := openClient(g, stderr)
@@ -34,20 +34,14 @@ watching new ledgers.`,
 				return err
 			}
 			defer closeClient()
-			from := sf.from
-			if from == 0 {
-				from, err = latestLedger(cmd.Context(), client)
-				if err != nil {
-					return err
-				}
-			}
+			sf.stateKey = stateKey("operations", filterPart("type", types), filterPart("source-account", sourceAccounts))
 			newSource := func(startLedger uint32) (stream.Source, error) {
 				return stream.NewOperationSource(client, stream.OperationQuery{
 					StartLedger: startLedger, PageLimit: sf.pageSize,
 					Types: types, SourceAccounts: sourceAccounts,
 				})
 			}
-			return runStream(cmd.Context(), newSource, from, &sf, g, stdout, stderr)
+			return runStream(cmd, client, newSource, sf.from, &sf, g, stdout, stderr)
 		},
 	}
 	sf.register(cmd, stream.DefaultTransactionPageLimit)

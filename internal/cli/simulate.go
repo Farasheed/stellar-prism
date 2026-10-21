@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"io"
 
@@ -28,7 +29,7 @@ and minimum resource fee.`,
 			if envelope == "" {
 				return fmt.Errorf("--tx-envelope is required")
 			}
-			if err := sf.validate(); err != nil {
+			if err := sf.validate(cmd); err != nil {
 				return err
 			}
 			client, closeClient, err := openClient(g, stderr)
@@ -36,19 +37,13 @@ and minimum resource fee.`,
 				return err
 			}
 			defer closeClient()
-			from := sf.from
-			if from == 0 {
-				from, err = latestLedger(cmd.Context(), client)
-				if err != nil {
-					return err
-				}
-			}
+			sf.stateKey = stateKey("simulate", fmt.Sprintf("envelope=%x", sha256.Sum256([]byte(envelope))))
 			newSource := func(startLedger uint32) (stream.Source, error) {
 				return stream.NewSimulationSource(client, stream.SimulationQuery{
 					TransactionEnvelope: envelope, StartLedger: startLedger,
 				})
 			}
-			return runStream(cmd.Context(), newSource, from, &sf, g, stdout, stderr)
+			return runStream(cmd, client, newSource, sf.from, &sf, g, stdout, stderr)
 		},
 	}
 	sf.register(cmd, 1)
