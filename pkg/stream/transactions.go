@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/stellar-optics/stellar-prism/pkg/rpc"
 
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 
-	"github.com/stellar-optics/stellar-prism/pkg/rpc"
+	"github.com/stellar/go-stellar-sdk/toid"
 )
 
 // DefaultTransactionPageLimit is the page size requested for transaction streams.
@@ -44,18 +47,27 @@ func (s *TransactionSource) Name() string { return "transactions" }
 func (s *TransactionSource) Rewind(ledger uint32) { s.query.StartLedger = ledger }
 
 // CursorLedger implements Source.
+// The RPC cursor format is "%019d-%010d" (toid-encoded + event order).
+// We need to extract the ledger from the first part to enable gap detection.
 func (s *TransactionSource) CursorLedger(cursor string) (uint32, bool) {
 	if cursor == "" {
 		return 0, false
 	}
-	// The transaction cursor is just a decimal ledger sequence in some RPC versions,
-	// but according to protocol it might be identical to LedgerPaginationOptions cursor.
-	// We'll parse it out. Since the events cursor is a compound string like "12345-1",
-	// let's try to parse a ledger from it. If it fails, fallback to simple decimal.
-	var ledger uint32
-	if _, err := fmt.Sscanf(cursor, "%d-", &ledger); err == nil {
-		return ledger, true
+	// Try parsing as a full event cursor (has the form ledger-tx-op-event)
+	if parts := strings.Split(cursor, "-"); len(parts) >= 2 {
+		// First part is toid-encoded; parse it and extract the ledger sequence.
+		idInt, err := strconv.ParseInt(parts[0], 10, 64)
+		if err == nil {
+			parsed := toid.Parse(idInt)
+			return uint32(parsed.LedgerSequence), true
+		}
+		// Fall back: try the second part as a plain ledger number.
+		if n, err := strconv.ParseUint(parts[1], 10, 32); err == nil {
+			return uint32(n), true
+		}
+		return 0, false
 	}
+	// No dash in cursor; try parsing as a plain decimal ledger.
 	n, err := strconv.ParseUint(cursor, 10, 32)
 	if err != nil {
 		return 0, false
