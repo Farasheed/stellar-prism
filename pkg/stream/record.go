@@ -27,6 +27,8 @@ const (
 	// KindWASMDeployment is a WASM upload or contract creation derived from a
 	// transaction envelope.
 	KindWASMDeployment Kind = "wasm_deployment"
+	KindFeeStats       Kind = "fee_stats"
+	KindTrade          Kind = "trade"
 )
 
 // Record is one item in a stream, whatever its source.
@@ -56,6 +58,8 @@ type Record struct {
 	StorageChange *StorageChange
 	// WASMDeployment is set when Kind is KindWASMDeployment.
 	WASMDeployment *WASMEvent
+	FeeStats       *FeeStats
+	Trade          *Trade
 }
 
 // Event is a Soroban event as delivered by RPC. The XDR fields are kept in
@@ -101,6 +105,39 @@ type Transaction struct {
 	ResultXDR string
 	// ResultMetaXDR is the base64 TransactionMeta.
 	ResultMetaXDR string
+	FailureReason string
+	ErrorCode     string
+	FailedOpIndex *uint32
+	FailedOpType  string
+}
+
+// FeeStats contains ledger fee-market measurements and rolling fee averages.
+type FeeStats struct {
+	BaseFee            uint32  `json:"baseFee"`
+	BaseReserve        uint32  `json:"baseReserve"`
+	FeePool            int64   `json:"feePool"`
+	CoinsInCirculation int64   `json:"coinsInCirculation"`
+	AverageFee10       float64 `json:"averageFee10"`
+	AverageFee50       float64 `json:"averageFee50"`
+	Transactions       uint32  `json:"transactions"`
+	SorobanResourceFee int64   `json:"sorobanResourceFee"`
+	SorobanFeeBid      int64   `json:"sorobanFeeBid"`
+}
+
+// Trade describes a classic or Soroban asset exchange in one operation.
+type Trade struct {
+	Protocol  string `json:"protocol"`
+	TxHash    string `json:"tx"`
+	Trader    string `json:"trader,omitempty"`
+	Maker     string `json:"maker,omitempty"`
+	Taker     string `json:"taker,omitempty"`
+	Operation string `json:"operation"`
+	AssetIn   string `json:"assetIn,omitempty"`
+	AmountIn  string `json:"amountIn,omitempty"`
+	AssetOut  string `json:"assetOut,omitempty"`
+	AmountOut string `json:"amountOut,omitempty"`
+	Price     string `json:"price,omitempty"`
+	OpIndex   uint32 `json:"opIndex"`
 }
 
 // StorageChange is a single contract-related ledger entry mutation extracted
@@ -128,7 +165,10 @@ type StorageChange struct {
 	EntryXDR string
 	// ChangeXDR is the base64 LedgerEntryChange exactly as the ledger emitted
 	// it, so consumers can re-decode without reconstructing anything.
-	ChangeXDR string
+	ChangeXDR       string
+	LiveUntilLedger uint32
+	RemainingTTL    uint32
+	TTLWarning      bool
 }
 
 // WASMEvent is a WASM upload or contract deployment derived from a successful

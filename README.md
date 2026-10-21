@@ -170,6 +170,31 @@ $ prism ledgers --follow --compact
 2026-08-04T14:35:53Z  ledger 3966820  e68b8…0c1e
 ```
 
+### Fee market, contract lifecycle and trades
+
+```sh
+# Ledger fee market and moving transaction fee averages
+prism fee-stats --follow
+
+# Follow contract storage, TTL expiry and deployment or upgrade activity
+prism contracts --watch CDLZF...CYSC --follow
+
+# Stream completed classic path-payment executions
+prism trades --pair XLM/USDC --follow
+```
+
+`fee-stats` reports base fee and reserve, fee pool, circulating coins,
+Soroban resource fees, and rolling 10 and 50 ledger transaction fee averages.
+`contracts` reports ledger-key TTL and warns below 1,000 remaining ledgers;
+RPC does not associate TTL key hashes with contract IDs, so TTL changes are
+included even when `--watch` selects contracts. `trades` currently normalizes
+classic strict-send and strict-receive path payments from their executed
+transaction results.
+
+Failed transaction streams include the transaction or operation result code
+inline, for example `failed at op 1 (payment): payment_underfunded`; NDJSON
+records carry `error_code` and `error_detail` fields.
+
 ## What prism guarantees
 
 This is a streaming tool, so the guarantee matters more than the feature list:
