@@ -38,6 +38,7 @@ type streamFlags struct {
 	maxGapRecoveries int
 	quiet            bool
 	verbosity        int
+	filter           stream.RecordFilter
 
 	output         string
 	rotateSize     int64
@@ -179,6 +180,7 @@ func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, err
 	return stream.Options{
 		Follow:           s.follow,
 		Limit:            s.limit,
+		Filter:           s.filter,
 		PollInterval:     s.poll,
 		MaxRetries:       s.retries,
 		GapStrategy:      strategy,
@@ -204,10 +206,13 @@ func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, err
 
 func newEventsCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 	var (
-		sf          streamFlags
-		contractIDs []string
-		topics      []string
-		eventTypes  []string
+		sf            streamFlags
+		contractIDs   []string
+		topics        []string
+		eventTypes    []string
+		filterExpr    string
+		topicRegex    []string
+		contractsFile string
 	)
 
 	cmd := &cobra.Command{
@@ -223,6 +228,11 @@ Topic filters are evaluated by the server and use its wildcard syntax: "*"
 matches exactly one segment, and "**" matches zero or more and must come
 last. The semantics are identical to ` + "`stellar events --topic`" + `.
 
+Use --filter-expr for client-side predicates over decoded values and topics,
+or --topic-regex for regular expressions over decoded topic symbols and
+strings. --contracts-file reads a hot-reloaded watchlist; addresses beyond
+the RPC limit of five are queried in coordinated groups.
+
 Events are retained by RPC for roughly 24 hours, so --from cannot reach
 further back than that. If the stream ever falls behind that window, prism
 reports the missed ledger range and exits 2 rather than skipping silently.`,
@@ -235,12 +245,59 @@ reports the missed ledger range and exits 2 rather than skipping silently.`,
   # NDJSON into jq
   prism events --contract CBGSB... --follow --json | jq -r '.contract'
 
+  # Filter decoded payload values locally
+  prism events --filter-expr 'value.amount > 1000000000 && topics[0].symbol == "transfer"'
+
+  # Match related topic names and hot-reload a larger contract set
+  prism events --contracts-file /etc/prism/watchlist.txt --topic-regex '0:^transfer.*,1:.*' --follow
+
   # Backfill from a ledger then keep following
   prism events --from 1234567 --follow`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := sf.validate(); err != nil {
 				return err
+			}
+			filters := stream.FilterSet{}
+			if filterExpr != "" {
+				compiled, err := stream.CompileExpression(filterExpr)
+				if err != nil {
+					return err
+				}
+				filters = append(filters, compiled)
+			}
+			if len(topicRegex) > 0 {
+				compiled, err := stream.CompileTopicRegexFilter(topicRegex)
+				if err != nil {
+					return err
+				}
+				filters = append(filters, compiled)
+			}
+			if len(filters) > 0 {
+				sf.filter = filters
+			}
+			var watchlist *stream.WatchlistManager
+			streamCtx := cmd.Context()
+			var cancelWatch context.CancelFunc
+			if contractsFile != "" {
+				if len(contractIDs) != 0 {
+					return fmt.Errorf("--contract cannot be combined with --contracts-file")
+				}
+				var err error
+				watchlist, err = stream.NewWatchlistManager(contractsFile)
+				if err != nil {
+					return err
+				}
+				streamCtx, cancelWatch = context.WithCancel(cmd.Context())
+				defer cancelWatch()
+				if err := watchlist.Start(streamCtx); err != nil {
+					return err
+				}
+				go func() {
+					for err := range watchlist.Errors() {
+						fmt.Fprintf(stderr, "prism: %v\n", err)
+					}
+				}()
 			}
 
 			client, closeClient, err := openClient(g, stderr)
@@ -261,16 +318,20 @@ reports the missed ledger range and exits 2 rather than skipping silently.`,
 			}
 
 			newSource := func(startLedger uint32) (stream.Source, error) {
-				return stream.NewEventSource(client, stream.EventQuery{
+				query := stream.EventQuery{
 					ContractIDs: contractIDs,
 					Topics:      topics,
 					EventTypes:  eventTypes,
 					StartLedger: startLedger,
 					PageLimit:   sf.pageSize,
-				})
+				}
+				if watchlist != nil {
+					query.Watchlist = watchlist
+				}
+				return stream.NewEventSource(client, query)
 			}
 
-			return runStream(cmd.Context(), newSource, from, &sf, g, stdout, stderr)
+			return runStream(streamCtx, newSource, from, &sf, g, stdout, stderr)
 		},
 	}
 
@@ -283,6 +344,9 @@ reports the missed ledger range and exits 2 rather than skipping silently.`,
 		`topic filter as comma-separated base64 ScVals, with "*" and "**" wildcards; repeatable, up to 5`)
 	cmd.Flags().StringSliceVar(&eventTypes, "type", nil,
 		"event type to include: contract, system or diagnostic (default: all)")
+	cmd.Flags().StringVar(&filterExpr, "filter-expr", "", "client-side boolean expression evaluated against decoded event payloads")
+	cmd.Flags().StringArrayVar(&topicRegex, "topic-regex", nil, "client-side topic rule as segment-index:regexp; repeatable and all rules must match")
+	cmd.Flags().StringVar(&contractsFile, "contracts-file", "", "read and hot-reload contract IDs from this file (one per line)")
 	sf.register(cmd, stream.DefaultPageLimit)
 	registerFlagCompletion(cmd, "type", "contract", "system", "diagnostic")
 	registerFlagCompletion(cmd, "gap-strategy", string(stream.GapFail), string(stream.GapResume))
@@ -391,6 +455,7 @@ func runStream(
 		drainer, err := stream.NewDrainer(stream.DrainerConfig{
 			NewSource:        newSource,
 			Sink:             out,
+			Filter:           sf.filter,
 			From:             from,
 			Workers:          sf.backfillWorkers,
 			Limit:            sf.limit,
