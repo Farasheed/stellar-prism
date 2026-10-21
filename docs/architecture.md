@@ -61,6 +61,7 @@ internal/cli/         cobra commands — thin wrappers over pkg/stream
   syncwriter.go       serialised stderr, for the diagnostics several goroutines write
 internal/fakerpc/     scriptable in-memory RPC for tests
 pkg/rpc/              the Client interface + SDK adapter
+  health.go           periodic getHealth and ledger latency evaluation
 pkg/stream/
   record.go           Record: the neutral item every source produces
   source.go           Source and Sink interfaces, GapError   ← the seams
@@ -234,6 +235,120 @@ single `rpc.Client`, so every command gains failover without knowing about it.
 
 Options: `WithHealthInterval` (0 disables the probe), `WithHealthTimeout`,
 `WithFailureCooldown`, `WithClientFactory` (tests inject fakes).
+
+The pool's probe is a liveness check: it asks an unhealthy endpoint for its
+latest ledger and restores it when the call succeeds. It is not the latency
+checker described below. The two share the word "health" because both answer
+"is this endpoint usable?", but they run for different reasons and on different
+schedules.
+
+## RPC health checking (`pkg/rpc/health.go`)
+
+`prism health` evaluates an endpoint with a single `getHealth` call. It is
+useful as a CI gate, a cron probe, or a manual check when a stream looks stuck:
+
+```console
+$ prism health
+2026-10-21T12:00:00Z  healthy    status=healthy  latest=500  oldest=490  ledger-latency=1.2s  probe-latency=4ms  retention=17280
+```
+
+A check fails for any of four observable reasons:
+
+| Condition | Error | Meaning |
+|---|---|---|
+| `getHealth` returns an error | `rpc.ErrHealthCheckFailed` | the endpoint could not answer |
+| `status` is not `"healthy"` | `rpc.ErrUnhealthyStatus` | the server says it is not serving normally |
+| required fields are missing or inconsistent | `rpc.ErrInvalidHealthResponse` | the response cannot be evaluated |
+| latest ledger close time is too old | `rpc.ErrStaleLedger` | the endpoint has fallen behind the chain |
+
+The report carries the metrics the decision used:
+
+| Metric | Source | Meaning |
+|---|---|---|
+| `LedgerLatency` | `now - latestLedgerCloseTime` | staleness of the newest ledger |
+| `ProbeLatency` | duration of the `getHealth` call | RPC round-trip time |
+| `LatestLedger`, `OldestLedger`, `LedgerRetentionWindow` | `getHealth` | the retention bounds a stream would inherit |
+| `ConsecutiveFailures` | the checker | how many checks in a row have failed |
+
+`getHealth` is exposed as the optional `rpc.HealthClient` interface rather than
+as a method on `rpc.Client`. The streaming core never calls it, and widening
+the streaming interface would force every existing `Client` implementation and
+test double to grow a method it does not use. `SDKClient` and `stream.Pool`
+both implement it, so `--rpc-url` may be repeated and a failed endpoint fails
+over exactly like a streamed call.
+
+### Flags
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--follow` / `-f` | off | keep checking instead of exiting after one probe |
+| `--interval` | `30s` | delay between checks under `--follow` |
+| `--health-timeout` | `5s` | bound on a single `getHealth` request |
+| `--max-ledger-age` | `60s` | staleness limit for the latest ledger |
+| `--fail-after` | `0` | with `--follow`, exit 1 after N consecutive failures (0 keeps watching) |
+| `--json` | off | one JSON object per check, one per line |
+
+One probe exits 0 when healthy and 1 when not. `--follow` resets the failure
+count on a healthy result; `--fail-after` is what turns a watch into a gate.
+Ctrl-C is a clean stop and exits 0, because an operator stopping a watch is not
+an endpoint failure. The command validates every flag before opening a client,
+so a bad interval never reaches the network.
+
+### Goroutine ownership
+
+The checker owns at most one goroutine. `Start` launches it and returns;
+`Stop` cancels it and **waits** for it to return. Every `Stop` waits, not only
+the first, so a second caller cannot report the checker stopped while a probe
+is still in flight. `Run` is the `Start`/`Stop` pair for a blocking command,
+and `defer Stop` handles the early-return paths. A one-shot `Check` starts no
+goroutine at all.
+
+The loop checks immediately, then on a ticker. It checks the context before
+each probe, and suppresses the observer when cancellation races with a probe:
+Ctrl-C must not print a spurious "unhealthy" line. The CLI joins the checker
+before it returns, so an interrupted `prism health --follow` leaves nothing
+running.
+
+### Determinism and offline tests
+
+`NewHealthChecker` takes an injected `HealthClient` and an injectable clock
+(`WithHealthClock`); it never constructs a client or contacts an endpoint by
+itself. Unit tests therefore run with no network and no real sleeps:
+
+- `pkg/rpc/health_test.go` covers every classification branch, the latency
+  arithmetic, failure reset, context cancellation, observer delivery, and both
+  `Stop` invariants (join an in-flight probe, idempotent stop).
+- `internal/cli/health_test.go` exercises the command end to end against
+  `internal/fakerpc`: healthy JSON, human output, stale and unhealthy exits,
+  `--follow --fail-after`, clean cancellation, flag validation before any RPC
+  call, and a client without the optional capability.
+- `fakerpc.WithHealthResponse`, `WithHealthError` and `WithHealthScript` stage
+  real response sequences, including a final entry that repeats so a periodic
+  test terminates without timing guesswork.
+
+Mutation-checked, the same way as the streaming invariants:
+
+| Mutation | Result |
+|---|---|
+| Staleness check disabled | `TestHealthCheckerClassifiesFailures/stale_ledger` fails: `Check() = healthy, want a failure` |
+| `Stop` returns without joining the loop | `TestHealthCheckerStopWaitsForInFlightProbe` fails: `Stop() returned while a probe was still in flight` |
+| Consecutive failures never reset | `TestHealthCheckerResetsFailuresAfterSuccess` fails: `recovery = healthy=true failures=2, want healthy and 0` |
+
+### Compatibility
+
+The feature is additive. `rpc.Client`, every existing command and every
+existing flag are unchanged. New exported surface:
+
+| Added | Where |
+|---|---|
+| `rpc.HealthClient` | `pkg/rpc/health.go` |
+| `rpc.HealthChecker`, `rpc.NewHealthChecker`, `rpc.HealthReport`, `rpc.HealthOption` | `pkg/rpc/health.go` |
+| `rpc.WithHealthInterval`, `WithHealthTimeout`, `WithMaxLedgerAge`, `WithHealthClock`, `WithHealthObserver` | `pkg/rpc/health.go` |
+| `rpc.DefaultHealthCheckInterval`, `DefaultHealthCheckTimeout`, `DefaultMaxLedgerAge` | `pkg/rpc/health.go` |
+| `rpc.ErrHealthUnsupported`, `ErrHealthCheckFailed`, `ErrUnhealthyStatus`, `ErrStaleLedger`, `ErrInvalidHealthResponse`, `ErrInvalidHealthConfig`, `ErrHealthCheckerStarted` | `pkg/rpc/health.go` |
+| `SDKClient.GetHealth`, `Pool.GetHealth` | `pkg/rpc/client.go`, `pkg/stream/pool.go` |
+| `--follow`, `--interval`, `--health-timeout`, `--max-ledger-age`, `--fail-after`, `--json` | `prism health` |
+| `fakerpc.WithHealthResponse`, `WithHealthError`, `WithHealthScript`, `fakerpc.HealthBehaviour` | `internal/fakerpc` |
 
 ## Derived transaction streams
 
@@ -619,7 +734,12 @@ returning an error, so one malformed value cannot kill a long-running tail.
 
 ## Adding an RPC method
 
-`pkg/rpc.Client` has four methods. Every one added must also be implemented in
+`pkg/rpc.Client` has five methods. Every one added must also be implemented in
 `internal/fakerpc`, so prefer composing the existing calls. The interface is
 small on purpose: it is the boundary that keeps the entire streaming core
 testable without a network.
+
+A method used by only one command belongs in its own optional interface, as
+`LedgerEntriesClient` and `HealthClient` do. That keeps stream-only fakes small
+and makes a missing capability an explicit, testable error rather than a
+compile-time burden on every implementation.

@@ -272,6 +272,20 @@ func (p *Pool) GetLatestLedger(ctx context.Context) (protocol.GetLatestLedgerRes
 	})
 }
 
+// GetHealth implements rpc.HealthClient, so the health command works when
+// --rpc-url is repeated. Failover, cooldowns and permanent-error handling are
+// the same as for every other pooled call.
+func (p *Pool) GetHealth(ctx context.Context) (protocol.GetHealthResponse, error) {
+	return poolCall(p, ctx, "getHealth", func(c rpc.Client) (protocol.GetHealthResponse, error) {
+		health, ok := c.(rpc.HealthClient)
+		if !ok {
+			return protocol.GetHealthResponse{}, rpc.Permanent(fmt.Errorf(
+				"%w: pooled endpoint does not implement HealthClient", rpc.ErrHealthUnsupported))
+		}
+		return health.GetHealth(ctx)
+	})
+}
+
 // isHealthy reports the current health mark for ep.
 func (p *Pool) isHealthy(ep *endpoint) bool {
 	p.mu.Lock()

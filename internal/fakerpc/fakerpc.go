@@ -80,6 +80,24 @@ type Server struct {
 	txs protocol.GetTransactionsResponse
 	// entries maps an encoded ledger key to its canned result.
 	entries map[string]protocol.LedgerEntryResult
+
+	// health is the explicit getHealth response; healthSet distinguishes it
+	// from an unconfigured zero value.
+	health      protocol.GetHealthResponse
+	healthSet   bool
+	healthErr   error
+	healthCalls int
+	// healthScript stages a sequence of responses for periodic-check tests.
+	healthScript []HealthBehaviour
+}
+
+// HealthBehaviour scripts one getHealth response. A non-nil Err takes
+// precedence over Response.
+type HealthBehaviour struct {
+	// Response is returned as-is when Err is nil.
+	Response protocol.GetHealthResponse
+	// Err is returned instead of Response.
+	Err error
 }
 
 // Option configures a Server.
@@ -98,6 +116,41 @@ func WithScript(script map[int]Behaviour) Option {
 // WithRetention sets the reported oldest retained ledger.
 func WithRetention(oldest uint32) Option {
 	return func(s *Server) { s.oldest = oldest }
+}
+
+// WithHealthResponse makes GetHealth return resp.
+func WithHealthResponse(resp protocol.GetHealthResponse) Option {
+	return func(s *Server) {
+		s.health = resp
+		s.healthSet = true
+		s.healthErr = nil
+		s.healthScript = nil
+	}
+}
+
+// WithHealthError makes GetHealth return err. A nil error is ignored, so a
+// table-driven test can pass an empty failure without clearing its response.
+func WithHealthError(err error) Option {
+	return func(s *Server) {
+		if err == nil {
+			return
+		}
+		s.healthErr = err
+		s.healthSet = false
+		s.healthScript = nil
+	}
+}
+
+// WithHealthScript installs getHealth behaviours keyed by zero-based call
+// index. The final entry repeats once the script is exhausted, which makes a
+// periodic test terminate without timing guesswork.
+func WithHealthScript(script []HealthBehaviour) Option {
+	return func(s *Server) {
+		s.healthScript = make([]HealthBehaviour, len(script))
+		copy(s.healthScript, script)
+		s.healthSet = false
+		s.healthErr = nil
+	}
 }
 
 // NewServer returns a fake serving the given events.
@@ -182,6 +235,32 @@ func (s *Server) SetLedgerEntries(entries map[string]protocol.LedgerEntryResult)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.entries = entries
+}
+
+// SetHealth installs an explicit getHealth response.
+func (s *Server) SetHealth(resp protocol.GetHealthResponse) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.health = resp
+	s.healthSet = true
+	s.healthErr = nil
+	s.healthScript = nil
+}
+
+// SetHealthError makes every subsequent GetHealth call fail with err.
+func (s *Server) SetHealthError(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.healthErr = err
+	s.healthSet = false
+	s.healthScript = nil
+}
+
+// HealthCalls reports how many getHealth calls the fake has served.
+func (s *Server) HealthCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.healthCalls
 }
 
 // SetContractWasm installs the instance and code entries for a contract whose
@@ -573,6 +652,55 @@ func (s *Server) GetLedgerEntries(ctx context.Context, req protocol.GetLedgerEnt
 		resp.Entries = append(resp.Entries, entry)
 	}
 	return resp, nil
+}
+
+// GetHealth implements rpc.HealthClient.
+//
+// Without an explicit response or script it derives a healthy answer from the
+// fake's ledger data, so a test that only cares about a transport failure does
+// not have to construct the full response.
+func (s *Server) GetHealth(ctx context.Context) (protocol.GetHealthResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return protocol.GetHealthResponse{}, err
+	}
+
+	call := s.healthCalls
+	s.healthCalls++
+
+	if len(s.healthScript) > 0 {
+		index := call
+		if index >= len(s.healthScript) {
+			index = len(s.healthScript) - 1
+		}
+		behaviour := s.healthScript[index]
+		if behaviour.Err != nil {
+			return protocol.GetHealthResponse{}, behaviour.Err
+		}
+		return behaviour.Response, nil
+	}
+	if s.healthErr != nil {
+		return protocol.GetHealthResponse{}, s.healthErr
+	}
+	if s.healthSet {
+		return s.health, nil
+	}
+
+	now := time.Now()
+	var retention uint32
+	if s.latest >= s.oldest {
+		retention = s.latest - s.oldest
+	}
+	return protocol.GetHealthResponse{
+		Status:                "healthy",
+		LatestLedger:          s.latest,
+		LatestLedgerCloseTime: now.Unix(),
+		OldestLedger:          s.oldest,
+		OldestLedgerCloseTime: now.Add(-time.Duration(retention) * 5 * time.Second).Unix(),
+		LedgerRetentionWindow: retention,
+	}, nil
 }
 
 // GetLatestLedger implements rpc.Client.
