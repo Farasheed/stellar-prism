@@ -150,6 +150,7 @@ official ` + "`stellar events`" + ` command does that better. prism is for watch
 		newABICmd(g, stdout, stderr),
 		newStorageCmd(g, stdout, stderr),
 		newWASMCmd(g, stdout, stderr),
+		newHealthCmd(g, stdout, stderr),
 		newTxCmd(g, stdout, stderr),
 		newVersionCmd(stdout),
 		newCompletionCmd(stdout),
