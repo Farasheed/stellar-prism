@@ -383,7 +383,9 @@ func (s *Server) GetEvents(ctx context.Context, req protocol.GetEventsRequest) (
 	return respond(out), nil
 }
 
-// GetEventsBatch implements rpc.Client.
+// GetEventsBatch implements rpc.Client, serving every request in order and
+// stopping at the first scripted failure — the responses gathered before it
+// are returned with the error so the caller can see how far the batch got.
 func (s *Server) GetEventsBatch(ctx context.Context, reqs []protocol.GetEventsRequest) ([]protocol.GetEventsResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -393,18 +395,20 @@ func (s *Server) GetEventsBatch(ctx context.Context, reqs []protocol.GetEventsRe
 	}
 
 	responses := make([]protocol.GetEventsResponse, 0, len(reqs))
-	for i, req := range reqs {
-		call := s.calls + i
+	for _, req := range reqs {
+		// Each entry in the batch is one call as far as the script is
+		// concerned, so the indices advance in step with the requests.
+		call := s.calls
 		s.calls++
 		b := s.script[call]
 
 		if b.Err != nil {
-			return protocol.GetEventsResponse{}, b.Err
+			return responses, b.Err
 		}
 
 		hasCursor := req.Pagination != nil && req.Pagination.Cursor != nil
 		if hasCursor && req.StartLedger != 0 {
-			return protocol.GetEventsResponse{}, errors.New("ledger ranges and cursor cannot both be set")
+			return responses, errors.New("ledger ranges and cursor cannot both be set")
 		}
 
 		oldest, latest := s.oldest, s.latest
@@ -431,10 +435,12 @@ func (s *Server) GetEventsBatch(ctx context.Context, reqs []protocol.GetEventsRe
 		}
 
 		if b.Empty {
-			return respond(nil), nil
+			responses = append(responses, respond(nil))
+			continue
 		}
 		if b.ReplayLast {
-			return respond(s.lastEvents), nil
+			responses = append(responses, respond(s.lastEvents))
+			continue
 		}
 
 		// Select everything strictly after the cursor, or from the start ledger.
@@ -474,10 +480,11 @@ func (s *Server) GetEventsBatch(ctx context.Context, reqs []protocol.GetEventsRe
 			if len(out) > 0 {
 				resp.Cursor = out[len(out)-1].ID
 			}
-			return resp, nil
+			responses = append(responses, resp)
+			continue
 		}
 
-		return respond(out), nil
+		responses = append(responses, respond(out))
 	}
 	return responses, nil
 }
