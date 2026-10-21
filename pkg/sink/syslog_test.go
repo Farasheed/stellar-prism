@@ -190,7 +190,7 @@ func TestSyslogRejectsBadRecord(t *testing.T) {
 func TestSyslogPropagatesWriterError(t *testing.T) {
 	t.Parallel()
 
-	s := newTestSyslog(t, sink.SyslogOptions{Writer: failingWriter{}})
+	s := newTestSyslog(t, sink.SyslogOptions{Writer: syslogFailingWriter{}})
 	err := s.Emit(eventRecord())
 	if err == nil {
 		t.Fatal("Emit() error = nil, want the writer failure")
@@ -200,9 +200,9 @@ func TestSyslogPropagatesWriterError(t *testing.T) {
 	}
 }
 
-type failingWriter struct{}
+type syslogFailingWriter struct{}
 
-func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("boom") }
+func (syslogFailingWriter) Write([]byte) (int, error) { return 0, errors.New("boom") }
 
 type closableBuffer struct {
 	bytes.Buffer

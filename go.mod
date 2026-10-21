@@ -3,6 +3,8 @@ module github.com/stellar-optics/stellar-prism
 go 1.25
 
 require (
+	github.com/fsnotify/fsnotify v1.9.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/spf13/cobra v1.10.2
 	github.com/stellar-optics/stellar-xdr-lens v0.2.0
 	github.com/stellar/go-stellar-sdk v0.7.3
@@ -22,4 +24,5 @@ require (
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/exp v0.0.0-20231006140011-7918f672742d // indirect
 	golang.org/x/sync v0.18.0 // indirect
+	golang.org/x/sys v0.38.0 // indirect
 )

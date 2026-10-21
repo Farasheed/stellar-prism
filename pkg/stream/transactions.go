@@ -19,11 +19,17 @@ const DefaultTransactionPageLimit = 100
 
 // TransactionQuery describes which transactions to stream.
 type TransactionQuery struct {
+	// Memo matches a prefix of the sanitized text memo; empty disables filtering.
+	Memo string
 	// StartLedger is where a fresh stream begins. Zero means start from the
 	// server's newest ledger.
 	StartLedger uint32
 	// PageLimit is the page size to request.
 	PageLimit uint
+	// Classify decodes each envelope and result to fill Status, FeeAccount,
+	// FeeBump and Failure. It costs two XDR decodes per record, so it is
+	// opt-in; the filtered transaction sources enable it automatically.
+	Classify bool
 }
 
 // TransactionSource streams transactions from RPC.
@@ -53,13 +59,21 @@ func (s *TransactionSource) CursorLedger(cursor string) (uint32, bool) {
 	if cursor == "" {
 		return 0, false
 	}
-	// Try parsing as a full event cursor (has the form ledger-tx-op-event)
+	// Try parsing as a full cursor (has the form ledger-tx-op-event). RPC
+	// cursors are TOID-encoded, while the derived sources synthesise a plain
+	// zero-padded ledger in the first segment; both must be understood.
 	if parts := strings.Split(cursor, "-"); len(parts) >= 2 {
-		// First part is toid-encoded; parse it and extract the ledger sequence.
 		idInt, err := strconv.ParseInt(parts[0], 10, 64)
 		if err == nil {
 			parsed := toid.Parse(idInt)
-			return uint32(parsed.LedgerSequence), true
+			// A valid ledger sequence is never zero, so a zero here means the
+			// first segment is a plain ledger rather than a TOID.
+			if parsed.LedgerSequence != 0 {
+				return uint32(parsed.LedgerSequence), true
+			}
+		}
+		if n, err := strconv.ParseUint(parts[0], 10, 32); err == nil {
+			return uint32(n), true
 		}
 		// Fall back: try the second part as a plain ledger number.
 		if n, err := strconv.ParseUint(parts[1], 10, 32); err == nil {
@@ -101,14 +115,23 @@ func (s *TransactionSource) Fetch(ctx context.Context, cursor string) (Batch, er
 		Full:       uint(len(resp.Transactions)) >= s.query.PageLimit,
 	}
 	for _, tx := range resp.Transactions {
-		batch.Records = append(batch.Records, transactionRecord(tx))
+		record := transactionRecord(tx)
+		if s.query.Classify {
+			if err := EnrichTransaction(record.Transaction); err != nil {
+				return Batch{}, fmt.Errorf("transaction source: %w", err)
+			}
+		}
+		if s.query.Memo != "" && (record.Transaction.Memo == nil || record.Transaction.Memo.Type != "text" || !strings.HasPrefix(record.Transaction.Memo.Value, s.query.Memo)) {
+			continue
+		}
+		batch.Records = append(batch.Records, record)
 	}
 	return batch, nil
 }
 
 // transactionRecord converts an RPC transaction into a neutral Record.
 func transactionRecord(tx protocol.TransactionInfo) Record {
-	return Record{
+	r := Record{
 		ID:       fmt.Sprintf("%010d-%04d", tx.Ledger, tx.ApplicationOrder),
 		Sequence: tx.Ledger,
 		Time:     time.Unix(tx.LedgerCloseTime, 0).UTC(),
@@ -122,4 +145,10 @@ func transactionRecord(tx protocol.TransactionInfo) Record {
 			ResultMetaXDR: tx.ResultMetaXDR,
 		},
 	}
+	if memo, err := DecodeMemo(tx.EnvelopeXDR); err == nil {
+		r.Transaction.Memo = &memo
+	} else {
+		r.Transaction.MemoError = err.Error()
+	}
+	return r
 }

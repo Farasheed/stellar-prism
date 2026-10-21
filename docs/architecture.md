@@ -61,15 +61,24 @@ internal/cli/         cobra commands — thin wrappers over pkg/stream
   syncwriter.go       serialised stderr, for the diagnostics several goroutines write
 internal/fakerpc/     scriptable in-memory RPC for tests
 pkg/rpc/              the Client interface + SDK adapter
+  health.go           periodic getHealth and ledger latency evaluation
 pkg/stream/
   record.go           Record: the neutral item every source produces
   source.go           Source and Sink interfaces, GapError   ← the seams
   tail.go             the state machine
   events.go           contract events source
   ledgers.go          ledger close source
-  transactions.go     transaction source
+  transactions.go     transaction source and opt-in classification
+  tx_status.go        status/failure decoding and the filtered tx source
+  traps.go            Soroban trap predicate and trap source
+  feebump.go          fee-bump classification and fee-account filters
+  dedup.go            bounded ring-buffer de-duplication for re-polls
   storage_changes.go  contract storage mutations (from tx meta)
   wasm_events.go      WASM uploads and contract deployments
+  operations.go        operation-level transaction demux
+  footprint.go         same-ledger Soroban footprint conflicts
+  simulate.go          live transaction simulation estimates
+  reorder.go            intra-ledger response reordering buffer
   pool.go             multi-endpoint failover RPC client
   drainer.go          concurrent historical backfill + ordered merge
   batcher.go          count/time batching sink wrapper
@@ -78,10 +87,15 @@ pkg/stream/
   cursor_store.go     file-backed cursor metadata journal
   context.go          TaskGroup and cancellation helpers
   clock.go            Clock and Backoff, both injectable
+  topic_pattern.go    client-side topic matching over decoded text
+  demux.go            per-contract fan-out, queues + one goroutine each
+  time_window.go      --since → approximate start ledger
+  backoff.go          AdaptivePoller for --adaptive follow waits
 pkg/sink/
   ndjson.go           NDJSON, one object per line
   human.go            terminal output, payloads via lens
   file_rotator.go     size/time rotating file sink, optional gzip
+  dlq.go              dead letter queue for malformed or undeliverable records
 ```
 
 ## The state machine
@@ -175,6 +189,70 @@ and `Close` stops the timer and flushes the remainder, so Ctrl-C cannot leave
 a buffered record behind. Sinks that implement `BatchSink` (both built-ins do)
 flush once per batch; other sinks are driven with one `Emit` per record.
 
+### --since: relative windows, offline and approximate
+
+`--since 10m` converts a relative window into a start ledger by dividing the
+window by `RoughLedgerCloseInterval` (5s, in `time_window.go`) and rounding
+**up**, so a window never starts *later* than asked. The conversion is pure
+arithmetic on the server's reported head: one RPC call (`getLatestLedger`, the
+same one a run with no `--from` makes anyway), no second call to measure the
+real cadence. The ledger rate varies with network load, so the result is
+approximate by design — streams needing an exact ledger use `--from`. Very
+long windows clamp to ledger 1, where the server's own retention error takes
+over.
+
+### Client-side topic patterns
+
+The server-side `--topic` filters are constrained to base64 ScVal segments
+with `*`/`**` wildcards, because that is all the RPC understands. `--topic-pattern`
+adds glob, prefix and regular-expression matching over the **decoded** topic
+text, applied client-side in `topic_pattern.go` by a `PatternSink` that wraps
+the output sink. The text it matches against is derived from the same lens
+envelope `--json` prints, so a pattern tuned against `--json` output works
+unchanged here — and filtering lives at the sink seam rather than inside the
+tailer, so the delivery guarantee and cursor mechanics are untouched by
+output shaping.
+
+### Per-contract fan-out
+
+`--fanout-dir` routes one stream to one NDJSON file per contract while the
+terminal keeps the combined output. The routing lives in `stream.Demux`
+(demux.go): an intake queue, a single dispatcher goroutine, and one queue plus
+goroutine per subscribed contract. Records are routed by `Event.ContractID`;
+each subscriber's queue holds a small buffer and overflows by counting drops
+rather than wedging the other contracts. `Close` after the tailer stops
+drains everything the caller accepted, closes each queue from the dispatcher
+—the only closer, after its last send — flushes, and waits on every goroutine,
+so a fanout run terminates with no leaked goroutines and a joined error.
+
+### Re-poll de-duplication
+
+`--dedup-window N` wraps the event sink in `stream.DedupSink`, which
+suppresses a record whose fingerprint was already emitted within the last `N`
+keys. The window is a fixed-size ring (`dedup.go`): the oldest key is evicted
+when a new one arrives, so memory is bounded by count rather than by traffic
+or elapsed time, and a hot contract cannot grow it without bound. A zero
+window disables the wrapper entirely.
+
+The fingerprint prefers the server's event ID, because a re-poll after a
+reconnect replays the same ID while two genuinely distinct events can carry
+byte-identical topics and values. Records without an ID fall back to a
+content hash over the event locator and payload. De-duplication lives at the
+sink seam, like pattern filtering, so the cursor still advances across a
+suppressed record and the tailer's delivery guarantee is unchanged.
+
+### Adaptive polling
+
+`--adaptive` replaces the fixed `--poll` wait with an `AdaptivePoller`
+(backoff.go) whose only signal is how many new ledgers closed during the last
+wait: at least one means the wait matched or beat the ledger cadence, so
+shorten; zero means mostly dead time, so lengthen. With no cadence parameter
+at all that rule converges on oscillating around the real close rate, tracking
+a network it is never told about — and the stretchy bounds (`--min-poll`-less
+defaults 1s..30s) keep the invariant: never faster than Min, never slower
+than Max. Jitter spreads each returned wait over its lower half so several
+prism instances do not poll in phase. The tuner is one number in one
+goroutine, so its tests run deterministically — no wall-clock flakiness.
 ### Parallel historical backfill
 
 `--backfill-workers N` (with an explicit `--from`) uses `Drainer` instead of
@@ -201,9 +279,9 @@ or returned as a `*GapError` under the default policy.
 The first non-cancellation error cancels every sibling; `Wait` blocks until
 all workers have returned and then cancels the shared context. A caller
 cancellation is a clean stop, not an error. `Drainer.Run` waits for every
-worker on every path, including sink failure and limit exhaustion, so a
-terminated backfill cannot leak goroutines or leave a worker writing to a
+worker on every path, including sink failure and limit exhaustion, soa terminated backfill cannot leak goroutines or leave a worker writing to a
 closed sink.
+
 
 ### What is deliberately *not* handled
 
@@ -234,6 +312,120 @@ single `rpc.Client`, so every command gains failover without knowing about it.
 Options: `WithHealthInterval` (0 disables the probe), `WithHealthTimeout`,
 `WithFailureCooldown`, `WithClientFactory` (tests inject fakes).
 
+The pool's probe is a liveness check: it asks an unhealthy endpoint for its
+latest ledger and restores it when the call succeeds. It is not the latency
+checker described below. The two share the word "health" because both answer
+"is this endpoint usable?", but they run for different reasons and on different
+schedules.
+
+## RPC health checking (`pkg/rpc/health.go`)
+
+`prism health` evaluates an endpoint with a single `getHealth` call. It is
+useful as a CI gate, a cron probe, or a manual check when a stream looks stuck:
+
+```console
+$ prism health
+2026-10-21T12:00:00Z  healthy    status=healthy  latest=500  oldest=490  ledger-latency=1.2s  probe-latency=4ms  retention=17280
+```
+
+A check fails for any of four observable reasons:
+
+| Condition | Error | Meaning |
+|---|---|---|
+| `getHealth` returns an error | `rpc.ErrHealthCheckFailed` | the endpoint could not answer |
+| `status` is not `"healthy"` | `rpc.ErrUnhealthyStatus` | the server says it is not serving normally |
+| required fields are missing or inconsistent | `rpc.ErrInvalidHealthResponse` | the response cannot be evaluated |
+| latest ledger close time is too old | `rpc.ErrStaleLedger` | the endpoint has fallen behind the chain |
+
+The report carries the metrics the decision used:
+
+| Metric | Source | Meaning |
+|---|---|---|
+| `LedgerLatency` | `now - latestLedgerCloseTime` | staleness of the newest ledger |
+| `ProbeLatency` | duration of the `getHealth` call | RPC round-trip time |
+| `LatestLedger`, `OldestLedger`, `LedgerRetentionWindow` | `getHealth` | the retention bounds a stream would inherit |
+| `ConsecutiveFailures` | the checker | how many checks in a row have failed |
+
+`getHealth` is exposed as the optional `rpc.HealthClient` interface rather than
+as a method on `rpc.Client`. The streaming core never calls it, and widening
+the streaming interface would force every existing `Client` implementation and
+test double to grow a method it does not use. `SDKClient` and `stream.Pool`
+both implement it, so `--rpc-url` may be repeated and a failed endpoint fails
+over exactly like a streamed call.
+
+### Flags
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--follow` / `-f` | off | keep checking instead of exiting after one probe |
+| `--interval` | `30s` | delay between checks under `--follow` |
+| `--health-timeout` | `5s` | bound on a single `getHealth` request |
+| `--max-ledger-age` | `60s` | staleness limit for the latest ledger |
+| `--fail-after` | `0` | with `--follow`, exit 1 after N consecutive failures (0 keeps watching) |
+| `--json` | off | one JSON object per check, one per line |
+
+One probe exits 0 when healthy and 1 when not. `--follow` resets the failure
+count on a healthy result; `--fail-after` is what turns a watch into a gate.
+Ctrl-C is a clean stop and exits 0, because an operator stopping a watch is not
+an endpoint failure. The command validates every flag before opening a client,
+so a bad interval never reaches the network.
+
+### Goroutine ownership
+
+The checker owns at most one goroutine. `Start` launches it and returns;
+`Stop` cancels it and **waits** for it to return. Every `Stop` waits, not only
+the first, so a second caller cannot report the checker stopped while a probe
+is still in flight. `Run` is the `Start`/`Stop` pair for a blocking command,
+and `defer Stop` handles the early-return paths. A one-shot `Check` starts no
+goroutine at all.
+
+The loop checks immediately, then on a ticker. It checks the context before
+each probe, and suppresses the observer when cancellation races with a probe:
+Ctrl-C must not print a spurious "unhealthy" line. The CLI joins the checker
+before it returns, so an interrupted `prism health --follow` leaves nothing
+running.
+
+### Determinism and offline tests
+
+`NewHealthChecker` takes an injected `HealthClient` and an injectable clock
+(`WithHealthClock`); it never constructs a client or contacts an endpoint by
+itself. Unit tests therefore run with no network and no real sleeps:
+
+- `pkg/rpc/health_test.go` covers every classification branch, the latency
+  arithmetic, failure reset, context cancellation, observer delivery, and both
+  `Stop` invariants (join an in-flight probe, idempotent stop).
+- `internal/cli/health_test.go` exercises the command end to end against
+  `internal/fakerpc`: healthy JSON, human output, stale and unhealthy exits,
+  `--follow --fail-after`, clean cancellation, flag validation before any RPC
+  call, and a client without the optional capability.
+- `fakerpc.WithHealthResponse`, `WithHealthError` and `WithHealthScript` stage
+  real response sequences, including a final entry that repeats so a periodic
+  test terminates without timing guesswork.
+
+Mutation-checked, the same way as the streaming invariants:
+
+| Mutation | Result |
+|---|---|
+| Staleness check disabled | `TestHealthCheckerClassifiesFailures/stale_ledger` fails: `Check() = healthy, want a failure` |
+| `Stop` returns without joining the loop | `TestHealthCheckerStopWaitsForInFlightProbe` fails: `Stop() returned while a probe was still in flight` |
+| Consecutive failures never reset | `TestHealthCheckerResetsFailuresAfterSuccess` fails: `recovery = healthy=true failures=2, want healthy and 0` |
+
+### Compatibility
+
+The feature is additive. `rpc.Client`, every existing command and every
+existing flag are unchanged. New exported surface:
+
+| Added | Where |
+|---|---|
+| `rpc.HealthClient` | `pkg/rpc/health.go` |
+| `rpc.HealthChecker`, `rpc.NewHealthChecker`, `rpc.HealthReport`, `rpc.HealthOption` | `pkg/rpc/health.go` |
+| `rpc.WithHealthInterval`, `WithHealthTimeout`, `WithMaxLedgerAge`, `WithHealthClock`, `WithHealthObserver` | `pkg/rpc/health.go` |
+| `rpc.DefaultHealthCheckInterval`, `DefaultHealthCheckTimeout`, `DefaultMaxLedgerAge` | `pkg/rpc/health.go` |
+| `rpc.ErrHealthUnsupported`, `ErrHealthCheckFailed`, `ErrUnhealthyStatus`, `ErrStaleLedger`, `ErrInvalidHealthResponse`, `ErrInvalidHealthConfig`, `ErrHealthCheckerStarted` | `pkg/rpc/health.go` |
+| `SDKClient.GetHealth`, `Pool.GetHealth` | `pkg/rpc/client.go`, `pkg/stream/pool.go` |
+| `--follow`, `--interval`, `--health-timeout`, `--max-ledger-age`, `--fail-after`, `--json` | `prism health` |
+| `fakerpc.WithHealthResponse`, `WithHealthError`, `WithHealthScript`, `fakerpc.HealthBehaviour` | `internal/fakerpc` |
+
 ## Derived transaction streams
 
 Soroban RPC has no dedicated endpoints for storage mutations or deployments.
@@ -261,6 +453,63 @@ network, so `--network-passphrase` must match the chain being streamed
 Both sources synthesise fixed-width zero-padded IDs (`%010d-%06d-…`) from
 the ledger sequence, preserving the lexicographic-order contract the tailer
 depends on.
+
+### Operation streams (`prism operations`)
+
+`OperationSource` decodes each transaction envelope and emits one record per
+operation with the deterministic ID `%010d-%04d-%02d`. It carries the operation
+type, effective source account, operation-body XDR and matching operation
+result, and supports type and source-account filters.
+
+### Footprint conflicts (`--detect-conflicts`)
+
+The tailer's reorder buffer closes a ledger before `FootprintAnalyzer` examines
+its Soroban transaction footprints. A key is reported when transactions share
+it and at least one access is read-write. The same conflict is attached to
+each participating transaction, allowing both human warnings and structured
+NDJSON consumers to identify hot keys and transaction sets.
+
+### Simulation streams (`prism simulate`)
+
+`SimulationSource` polls the latest ledger, calls `simulateTransaction` once
+for each newly observed head, decodes Soroban resource estimates, and compares
+successive return values through stellar-xdr-lens before emitting changed
+fields.
+
+### Transaction classification (`prism transactions`)
+
+`TransactionSource` accepts `TransactionQuery.Classify`, which fills four
+derived fields on each record by decoding the envelope and result through
+lens: `Status` (`success` or `failed`), `FeeAccount`, `FeeBump` and
+`Failure`. Classification is opt-in because it costs two XDR decodes per
+record; the filtered streams enable it automatically.
+
+`Failure` keeps every level at which the protocol reports a reason, because
+the most specific level is not always the one a consumer wants:
+
+- `Detail` is the transaction-level code (`tx_failed`, `tx_bad_seq`, …).
+- `Inner` is the inner transaction's code for a fee-bump wrapper, which is
+  almost always the real cause.
+- `Operation` is the first failing operation, with its own decoded code. A
+  Soroban host function that trapped or panicked appears here as
+  `invoke_host_function_trapped`, and `Failure.Trapped()` reports it.
+
+`TransactionFilterSource` wraps a classified `TransactionSource` and applies
+a status set plus zero or more `TransactionFilter` predicates after each page
+is fetched. Filtering therefore advances the cursor across suppressed
+records: `--status failed`, `--trapped`, `--fee-bump` and `--fee-account` are
+views of one stream, not separate streams that could skip history. `traps.go`
+exposes `TrappedFilter`/`NewTrapSource` for contract executions that trapped,
+which is distinct from a malformed invocation or an exceeded resource limit.
+`feebump.go` exposes `FeeBumpFilter`, `FeeAccountFilter` (which normalises a
+muxed address to its underlying account) and the `FeeBump` classification,
+which keeps the wrapper's fee payer, inner source, inner hash, fee bids and
+signature counts separate from the inner transaction.
+
+`prism transactions` always classifies, so the JSON line carries `status`,
+`feeAccount`, and `failure`/`feeBump` objects when they apply. The human sink
+names the failed operation and prints "contract execution trapped or
+panicked" for a trap.
 
 ## Cursor metadata and background pruning (`pkg/stream/pruning.go`)
 
@@ -293,7 +542,12 @@ The pieces:
 | `stream.DrainerConfig.OnPage` | how a concurrent backfill reports a delivered page |
 
 **The checkpoint is written after the emit, not before.** `Options.OnPage`
-fires once a page has been delivered in full. A page cut short by `--limit`,
+fires once a page has been delivered in full. Pages held in the ledger reorder
+buffer delay their checkpoints, including subsequent empty filtered pages;
+`Tailer.Cursor()` returns the delivered position, not the ahead-of-output fetch
+cursor. A bounded follow drains its buffered suffix when the available pages
+are exhausted and enough records are available to satisfy `--limit`, without
+waiting for another ledger. A page cut short by `--limit`,
 or one the sink rejected, produces no checkpoint, so a recorded position can
 never point past records that were not delivered. The callback also skips a
 page that returned nothing and left the cursor where it was: that says
@@ -363,6 +617,8 @@ feature adds to the public surface:
 | `stream.Options.OnPage`, `stream.Options.StartCursor` | `pkg/stream/tail.go` |
 | `stream.DrainerConfig.OnPage` | `pkg/stream/drainer.go` |
 | `--state-file`, `--resume`, `--prune-interval`, `--prune-keep`, `--prune-max-age` | every streaming command |
+| `sink.DLQ`, `sink.DLQEntry`, `sink.DLQOptions`, `sink.DLQStats`, `sink.NewDLQ`, `sink.ValidateRecord` | `pkg/sink/dlq.go` |
+| `--dlq-file` | every streaming command |
 
 `stream.Pruner` and `stream.FileMetadataStore` are new types rather than
 changes to existing ones, so a caller that ignores them compiles and behaves
@@ -386,6 +642,68 @@ Rotated files are named `<path>.<UTC timestamp>` (plus `.gz` when
 compressed). Rotation is synchronous; the active file is reopened before
 pruning, so a failed prune cannot stop the stream. `--rotate-*` without
 `--output-file` is rejected.
+
+## Dead letter queue (`--dlq-file`)
+
+A long-running tail must not die because one record is malformed or one write
+fails. `--dlq-file` wraps the chosen sink in `sink.DLQ`, which records the
+failure and keeps the stream running:
+
+```
+                      ┌──────────────┐
+   Tailer ── Record ─►│ sink.DLQ     ├──► chosen sink ──► stdout / --output-file
+                      │              │
+                      │   failure    ├──► --dlq-file (NDJSON, append)
+                      └──────────────┘
+```
+
+The wrapper implements both `stream.Sink` and `stream.BatchSink`, so every
+streaming command gains it without knowing it exists.
+
+| Field | Meaning |
+|---|---|
+| `kind` | always `"dlq"`, so a queue file is distinguishable from stream NDJSON |
+| `stage` | `validation`, `delivery` or `flush` |
+| `error` | the failure that prevented delivery |
+| `failedAt` | UTC timestamp, injectable through `DLQOptions.Now` |
+| `record` | the original record, preserved field-for-field; absent for `flush` |
+
+Two classes of failure are captured:
+
+- **Validation.** `sink.ValidateRecord` checks the structural contract every
+  sink relies on: a non-empty ID, a known `Kind`, and a payload pointer that
+  matches that kind. It deliberately does *not* reject XDR that lens cannot
+  decode — the built-in sinks already report that inline, and treating a
+  display problem as a delivery failure would be wrong.
+- **Delivery.** If the wrapped sink's `Emit` returns an error, the record is
+  written to the queue and the error is swallowed. Only a failure to write the
+  dead letter itself is returned, because at that point the record would vanish
+  with no trace. A primary `Flush` failure is captured as a `flush` entry for
+  the same reason: the per-record failures are already accounted for, and
+  failing the command at shutdown would defeat the queue's purpose.
+
+A captured record counts as delivered, so the tailer advances its cursor past
+it. The queue is the durable copy: replay its `record` field through a sink if
+the primary output must be complete. This is deliberate — blocking the cursor
+on a record the primary can never write would stall the stream forever — and
+it is why the queue is append-only and flushed per entry.
+
+`EmitBatch` validates and delivers one record at a time. A batch sink can fail
+part-way through a batch, after some records were written, so forwarding the
+whole batch again would duplicate them and forwarding nothing would lose them.
+Per-record isolation is what makes every failure attributable; the trade-off
+is that a DLQ-wrapped run does not amortise the wrapped sink's flushes. The
+batcher still controls when the tailer hands records over.
+
+The DLQ starts no goroutines. `Close` flushes the queue, closes the wrapped
+sink when it implements `io.Closer`, and closes the queue writer (when
+`CloseWriter` is set) — so `Ctrl-C`, a failed run and a normal exit all leave
+nothing open behind. It is idempotent, and each `Close` performs the flush it
+needs rather than returning early.
+
+`--dlq-file` is append-only and must differ from `--output-file`. Without
+`--dlq-file` the sink chain is unchanged: nothing is opened and no wrapper is
+inserted.
 
 ## Testing the guarantee
 
@@ -418,6 +736,19 @@ when it does. `internal/cli` runs the whole thing end to end against
 bounded while the stream runs, and a second run that picks up where the
 first stopped.
 
+The same guarantees also hold through the seams this file describes below:
+adaptive poll waits, `--since` window arithmetic, client-side topic
+patterns, and demux routing under concurrent submitters — all checked with
+`go test -race`.
+
+The dead letter queue is covered at both levels. `pkg/sink` tests every
+validation branch, delivery and flush failures (including a writer that
+fails like a full disk), batch attribution, and idempotent close against a
+real file. `internal/cli` runs `runStream` with a source that emits one valid
+record and one malformed record, then asserts that the valid record reached
+stdout, the malformed one reached `--dlq-file`, and the command exited
+successfully — the end-to-end shape of "a bad record does not crash a tail".
+
 Time is injected via `Clock`, so there are no real sleeps and no wall-clock
 flakiness. Follow-loop tests carry a sleep budget that cancels the context, so
 a regression that stops the tailer terminating **fails** rather than hanging
@@ -437,6 +768,9 @@ The invariants were verified by breaking the code on purpose:
 | Diagnostics written to stderr without serialisation | `TestSyncWriterSerialisesConcurrentWrites` fails with a `DATA RACE` report from the race detector |
 | Prune keeping the oldest entries | `TestFileMetadataStorePruneKeepsTheNewestPerKey` fails |
 | Final compaction at shutdown removed | `TestEventsCommandPrunesTheStateFile` fails: 10 checkpoints left instead of 2 |
+| DLQ swallowing a failure without recording it | `TestDLQCapturesDeliveryFailure` fails: no dead letter on disk |
+| DLQ returning a captured delivery failure | `TestDLQCapturesDeliveryFailure` fails: `Emit()` returned the error |
+| DLQ closing without flushing | `TestDLQClosesWriterAndPrimaryIdempotently` fails: the queue file is empty |
 
 If you change the state machine, re-run that exercise. A test suite that
 cannot fail is not protecting anything.
@@ -485,7 +819,7 @@ rendered in Soroban type syntax, and `--function` plus repeated `--arg` decodes
 actual base64 `ScVal` values through lens against the named parameters.
 
 `getLedgerEntries` is an optional capability (`rpc.LedgerEntriesClient`), not
-part of the streaming `rpc.Client` interface. That keeps the four-method core
+part of the streaming `rpc.Client` interface. That keeps the core interface
 small and avoids forcing stream-only fakes to implement a method they never
 use. Only the `abi` command takes this path; every streaming command remains
 independent of it.
@@ -657,7 +991,12 @@ bound even when `--batch` is not used.
 
 ## Adding an RPC method
 
-`pkg/rpc.Client` has four methods. Every one added must also be implemented in
+`pkg/rpc.Client` has a small set of methods. Every one added must also be implemented in
 `internal/fakerpc`, so prefer composing the existing calls. The interface is
 small on purpose: it is the boundary that keeps the entire streaming core
 testable without a network.
+
+A method used by only one command belongs in its own optional interface, as
+`LedgerEntriesClient` and `HealthClient` do. That keeps stream-only fakes small
+and makes a missing capability an explicit, testable error rather than a
+compile-time burden on every implementation.

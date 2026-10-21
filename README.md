@@ -60,7 +60,9 @@ returns — there is no polling loop, no cursor advancement, no reconnection, an
 | **Follow as ledgers close** | ❌ | ✅ |
 | **Cursor continuity across polls** | ❌ | ✅ |
 | **Reconnect with backoff** | ❌ | ✅ |
+| **Adaptive poll rate** | ❌ | ✅ (`--adaptive`) |
 | **NDJSON for pipelines** | ❌ | ✅ |
+| **Per-contract fan-out** | ❌ | ✅ (`--fanout-dir`) |
 | **Gap detection** | ❌ | ✅ |
 | Ledger streaming | ❌ | ✅ |
 | Contract-spec-decoded payloads | ✅ **better** | ❌ ([roadmap](docs/roadmap.md)) |
@@ -85,6 +87,9 @@ prism events --contract CDLZF...CYSC --follow
 # Backfill from a ledger, then keep following
 prism events --contract CDLZF...CYSC --from 3966000 --follow
 
+# Start about ten minutes back, without picking a ledger
+prism events --contract CDLZF...CYSC --since 10m --follow
+
 # Filter by topic, using the server's wildcard syntax
 prism events --topic 'AAAADwAAAANmZWUA,*' --limit 20
 ```
@@ -92,6 +97,32 @@ prism events --topic 'AAAADwAAAANmZWUA,*' --limit 20
 Topic filters are evaluated by the RPC server with the same semantics as
 `stellar events --topic`: `*` matches exactly one segment, `**` matches zero or
 more and must come last.
+
+`--since` converts a relative window into an approximate start ledger (ledgers
+close roughly every 5s; the window rounds up, so it never starts late). For
+topics, `--topic-pattern` matches their **decoded** text rather than base64
+XDR, with glob, prefix and regex segments:
+
+```sh
+# Any topic whose first segment starts with "transfer" (e.g. a symbol)
+prism events --topic-pattern 'prefix:transfer' --limit 20
+
+# Regex over the decoded topic text
+prism events --contract CBGSB... --topic-pattern 're:burn.*' --follow
+
+# Watch several contracts and split them into per-contract NDJSON files
+prism events --contract CDLZF... --contract CDLZA... --fanout-dir events/ --follow
+
+# Let the follow loop tune its own poll rate from observed ledger closes
+prism events --contract CDLZF... --follow --adaptive
+```
+
+`--fanout-dir` writes one NDJSON file per watched contract under the
+directory (streamed through a per-contract demux with bounded queues), while
+the terminal keeps the combined stream. `--adaptive` replaces the fixed
+`--poll` wait with a tuner whose only signal is how many ledgers closed
+during the last wait, so it tracks the network's own cadence between 1s and
+30s, jittered so several instances do not poll in phase.
 
 ### Batched output and parallel backfill
 
@@ -200,6 +231,46 @@ position it reached, and a page the `--limit` cut short is not reported at all.
 This narrows the restart window from "the whole run" to "one record". It is
 not exactly-once — see [What prism guarantees](#what-prism-guarantees).
 
+### `prism transactions` — successes, failures, traps and fee bumps
+
+Every transaction is classified as it streams: `status`, the account that
+actually paid the fee, and — for a fee-bump wrapper — the wrapper and inner
+transaction details side by side. Failed transactions carry a decoded reason
+naming the failing operation.
+
+```sh
+# Only failures, with the decoded reason
+prism transactions --status failed --follow
+
+# Soroban contract executions that trapped or panicked
+prism transactions --trapped --json | jq -r '.failure.operation.summary'
+
+# Fee-bump wrappers, and who paid for them
+prism transactions --fee-bump --json | jq -r '.feeAccount'
+
+# Everything a particular account paid the fee for
+prism transactions --fee-account GBGSB... --follow
+```
+
+`--trapped` is narrower than `--status failed`: it selects only host
+functions that trapped or panicked, not malformed invocations or exceeded
+resource limits. `--fee-account` accepts a G or M address and matches the
+effective payer, so a muxed fee source resolves to its underlying account.
+
+The filters are applied after each page is fetched, so the cursor still
+advances across suppressed transactions — a filtered stream is a view of the
+transaction stream rather than a second stream that could skip history.
+
+```console
+$ prism transactions --status failed --limit 1 --json
+{"kind":"transaction","id":"0003966820-0001","ledger":3966820,"hash":"…","index":1,"successful":false,"status":"failed","feeAccount":"GBGSB…","failure":{"code":"tx_failed","summary":"The transaction was well-formed and authorised, but at least one of its operations failed.","operation":{"index":0,"type":"invoke_host_function","code":"invoke_host_function_trapped","summary":"The contract trapped: it panicked, or explicitly returned an error."}}}
+```
+
+Event streams can additionally drop re-polled duplicates with
+`--dedup-window`: a bounded ring remembers the last N event fingerprints and
+suppresses a replay without growing with traffic. It is off by default; `4096`
+covers a page with margin.
+
 ### `prism tx` — why did this transaction fail?
 Fetches a transaction and renders it through the lens explain path, pairing the
 envelope with its result so the failure is attributed to the operation that
@@ -232,6 +303,37 @@ Operations (4)
 ```console
 $ prism ledgers --follow --compact
 2026-08-04T14:35:53Z  ledger 3966820  e68b8…0c1e
+```
+
+### `prism operations` - stream transaction operations
+
+Deconstructs transaction envelopes into independently filterable records with
+stable ledger/transaction/operation IDs:
+
+```sh
+prism operations --type payment --type invoke_host_function --follow --json
+prism operations --source-account G... --from 3966000
+```
+
+### `prism transactions --detect-conflicts` - find footprint contention
+
+Annotates Soroban transactions when read/write footprint keys overlap within a
+ledger. Human output prints warnings; `--json` adds structured `conflicts`
+metadata:
+
+```sh
+prism transactions --detect-conflicts --follow
+prism transactions --detect-conflicts --follow --json
+```
+
+### `prism simulate` - follow a transaction simulation
+
+Re-simulates a base64 transaction envelope as the chain head advances and
+reports changes to return values, instructions, memory bytes, and minimum
+resource fees:
+
+```sh
+prism simulate --tx-envelope AAA... --follow --json
 ```
 
 ## What prism guarantees
@@ -332,3 +434,79 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+### Safe transaction memos
+
+`prism transactions --memo 'invoice:' --follow --json` selects transactions
+whose **sanitized text memo starts with** `invoice:` (an exact memo also matches).
+Filtering is local and preserves RPC pagination, including pages with no matches.
+Memo IDs are decimal strings; hash and return memos are lowercase hex strings.
+The `memo` object has `type` (`none`, `text`, `id`, `hash`, or `return`) and `value`.
+Malformed envelopes retain their original XDR and report `memoError`.
+
+Control characters, invalid UTF-8, and invisible Unicode formatting characters
+are removed from decoded memo text. Terminal output escapes non-ASCII memo
+characters. Both compact summaries and decoded payloads are protected. Original
+base64 XDR is preserved for archival use.
+
+### Ledger consensus diagnostics
+
+```sh
+prism ledgers --consensus --follow --compact
+prism ledgers --consensus --expected-validator G... --follow --json
+```
+
+Consensus output includes the SCP value's close time, transaction-set hash,
+value type, observed value signer, signature presence, and the close delta in
+seconds between consecutive ledgers. Deltas over 10 seconds and absent expected
+value signers produce warnings. The first ledger, gaps, and rewinds have no delta;
+consensus diagnostics require sequential backfill (`--backfill-workers 1`).
+Malformed headers produce a structured `consensus.error` without stopping the
+stream. JSON sinks include these metrics under `consensus`, even with `--raw`.
+
+**Header coverage:** `LedgerHeaderHistoryEntry` contains a signed Stellar value,
+not the SCP envelopes, quorum-set hashes, or complete validator signatures.
+`valueSigners` identifies value-signing evidence only; signatures are not
+cryptographically verified. `quorumDataAvailable` is always false. An expected
+validator warning means its value signature was not observed in this header;
+it does not establish that the validator was offline. Full quorum health requires
+an additional SCP history/live SCP data source.
+
+### HTTP broadcasts
+
+```sh
+prism events --contract CDLZF... --follow --serve-sse 127.0.0.1:8080
+prism serve --sse 127.0.0.1:8080 --ws 127.0.0.1:8081
+curl -N http://127.0.0.1:8080/events
+```
+
+`serve` follows contract events by default and accepts the same contract/topic,
+RPC, cursor, and output flags as `events`. `--serve-sse` (alias `--sse`) and `--ws`
+are also available on other streaming commands. Each listener broadcasts records
+in the existing raw NDJSON shape; local terminal/file output remains available.
+Listeners stop when the stream ends, reaches `--limit`, or receives SIGINT/SIGTERM.
+Use `--follow` for a persistent listener on commands other than `serve`.
+
+SSE serves `/events`, with `id:` set to the record cursor and one JSON object in
+`data:`. It sends comment pings every 15 seconds. A reconnect with
+`Last-Event-ID` replays later records from the latest 1024 records held in memory,
+then atomically joins live delivery. Unknown or expired IDs receive HTTP 409;
+clients must explicitly restart from a suitable RPC ledger when replay expires.
+Replay is shared by clients and does not survive process restarts. A fresh
+connection without `Last-Event-ID` receives future records only.
+
+WebSockets serve `/events` and `/ws`. Connections initially receive all records.
+Send `{"subscribe":"contract","id":"CDLZF..."}` to restrict a connection to
+that contract, or `{"subscribe":"topic","id":"AAAAAQ=="}` to match an exact
+base64 XDR topic segment. Successful requests receive
+`{"subscribed":"contract","id":"CDLZF..."}`; invalid requests receive an
+`error` object. Subscriptions are additive (up to 128 per connection); contracts
+are ORed, topics are ORed, and the two categories are ANDed. Reconnect to reset
+subscriptions. WebSockets send periodic protocol pings and use the library's
+same-origin browser policy.
+
+Each client has a bounded queue. Slow clients disconnect rather than blocking
+RPC polling or other clients. SSE clients can reconnect using retained history;
+WebSocket delivery is live only. Write deadlines and shutdown cleanup release
+stalled connections. These listeners provide no authentication or TLS; choose
+the bind address explicitly and use a reverse proxy when needed.
