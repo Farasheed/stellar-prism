@@ -21,11 +21,12 @@ import (
 type poolFake struct {
 	rpc.Client
 
-	mu     sync.Mutex
-	err    error
-	latest uint32
-	calls  int
-	closed int
+	mu         sync.Mutex
+	err        error
+	latest     uint32
+	healthResp protocol.GetHealthResponse
+	calls      int
+	closed     int
 }
 
 func (f *poolFake) GetLatestLedger(ctx context.Context) (protocol.GetLatestLedgerResponse, error) {
@@ -39,6 +40,19 @@ func (f *poolFake) GetLatestLedger(ctx context.Context) (protocol.GetLatestLedge
 		return protocol.GetLatestLedgerResponse{}, f.err
 	}
 	return protocol.GetLatestLedgerResponse{Sequence: f.latest}, nil
+}
+
+func (f *poolFake) GetHealth(ctx context.Context) (protocol.GetHealthResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return protocol.GetHealthResponse{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if f.err != nil {
+		return protocol.GetHealthResponse{}, f.err
+	}
+	return f.healthResp, nil
 }
 
 func (f *poolFake) GetEvents(ctx context.Context, _ protocol.GetEventsRequest) (protocol.GetEventsResponse, error) {
@@ -350,6 +364,53 @@ func TestPoolImplementsEveryClientMethod(t *testing.T) {
 	}
 	if got := fake.callCount(); got != 3 {
 		t.Errorf("endpoint handled %d calls, want 3", got)
+	}
+}
+
+func TestPoolGetHealthFailsOver(t *testing.T) {
+	t.Parallel()
+
+	bad := &poolFake{err: errors.New("connection refused")}
+	good := &poolFake{healthResp: protocol.GetHealthResponse{
+		Status:       "healthy",
+		LatestLedger: 99,
+	}}
+	p := newFakePool(t, map[string]*poolFake{
+		"https://bad.example":  bad,
+		"https://good.example": good,
+	})
+
+	var _ rpc.HealthClient = p
+
+	resp, err := p.GetHealth(context.Background())
+	if err != nil {
+		t.Fatalf("GetHealth() error = %v, want failover to succeed", err)
+	}
+	if resp.Status != "healthy" || resp.LatestLedger != 99 {
+		t.Errorf("GetHealth() = %+v, want the healthy endpoint's response", resp)
+	}
+	if got := p.Healthy(); got != 1 {
+		t.Errorf("Healthy() = %d, want 1 after the failure", got)
+	}
+}
+
+func TestPoolGetHealthRejectsClientWithoutCapability(t *testing.T) {
+	t.Parallel()
+
+	p, err := stream.NewPool([]string{"https://a.example"},
+		stream.WithHealthInterval(0),
+		stream.WithClientFactory(func(string) rpc.Client { return &closeErrFake{} }))
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+
+	_, err = p.GetHealth(context.Background())
+	if !errors.Is(err, rpc.ErrHealthUnsupported) {
+		t.Fatalf("GetHealth() error = %v, want ErrHealthUnsupported", err)
+	}
+	if !rpc.IsPermanent(err) {
+		t.Errorf("error = %v, want the missing capability to be permanent", err)
 	}
 }
 
