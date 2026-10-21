@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"strconv"
 	"strings"
 	"time"
@@ -163,7 +164,137 @@ func extractPathPaymentTrades(tx *Transaction, ledger uint32, closeTime time.Tim
 		}
 		out = append(out, Record{ID: fmt.Sprintf("%010d-%06d-%06d", ledger, tx.Index, i), Sequence: ledger, Time: closeTime, Kind: KindTrade, Trade: trade})
 	}
+	if tx.ResultMetaXDR != "" {
+		var meta xdr.TransactionMeta
+		if xdr.SafeUnmarshalBase64(tx.ResultMetaXDR, &meta) == nil {
+			for i, event := range sorobanContractEvents(&meta) {
+				trade, ok := sorobanSwapTrade(event, tx.Hash, uint32(i))
+				if !ok {
+					continue
+				}
+				out = append(out, Record{ID: fmt.Sprintf("%010d-%06d-%06d", ledger, tx.Index, len(ops)+i), Sequence: ledger, Time: closeTime, Kind: KindTrade, Trade: trade})
+			}
+		}
+	}
 	return out, nil
+}
+
+func sorobanContractEvents(meta *xdr.TransactionMeta) []xdr.ContractEvent {
+	var events []xdr.ContractEvent
+	if meta.V == 3 && meta.V3 != nil && meta.V3.SorobanMeta != nil {
+		events = append(events, meta.V3.SorobanMeta.Events...)
+	}
+	if meta.V == 4 && meta.V4 != nil {
+		for _, event := range meta.V4.Events {
+			events = append(events, event.Event)
+		}
+	}
+	return events
+}
+
+// sorobanSwapTrade recognizes the common Soroban swap event shape:
+// (symbol("swap"), trader, asset_in, asset_out), with [amount_in, amount_out]
+// in the event value. Contract event schemas are application-defined, so
+// unknown layouts are left untouched instead of being guessed.
+func sorobanSwapTrade(event xdr.ContractEvent, hash string, index uint32) (*Trade, bool) {
+	if event.Type != xdr.ContractEventTypeContract || event.Body.V0 == nil {
+		return nil, false
+	}
+	topics := event.Body.V0.Topics
+	if len(topics) < 4 {
+		return nil, false
+	}
+	name, ok := scValName(topics[0])
+	if !ok || !(strings.EqualFold(name, "swap") || strings.EqualFold(name, "swapped")) {
+		return nil, false
+	}
+	trader, ok := scValAddress(topics[1])
+	if !ok {
+		return nil, false
+	}
+	assetIn, ok := scValAddress(topics[2])
+	if !ok {
+		return nil, false
+	}
+	assetOut, ok := scValAddress(topics[3])
+	if !ok {
+		return nil, false
+	}
+	values, ok := event.Body.V0.Data.GetVec()
+	if !ok || values == nil || len(*values) < 2 {
+		return nil, false
+	}
+	in, ok := scValInteger((*values)[0])
+	if !ok {
+		return nil, false
+	}
+	out, ok := scValInteger((*values)[1])
+	if !ok {
+		return nil, false
+	}
+	trade := &Trade{Protocol: "soroban", TxHash: hash, Trader: trader, Taker: trader, Operation: "swap", AssetIn: assetIn, AmountIn: in.String(), AmountUnit: "raw token units", AssetOut: assetOut, AmountOut: out.String(), OpIndex: index}
+	if in.Sign() > 0 {
+		ratio := new(big.Rat).SetFrac(out, in)
+		trade.Price = ratio.FloatString(8)
+	}
+	return trade, true
+}
+
+func scValName(value xdr.ScVal) (string, bool) {
+	if v, ok := value.GetSym(); ok {
+		return string(v), true
+	}
+	if v, ok := value.GetStr(); ok {
+		return string(v), true
+	}
+	return "", false
+}
+func scValAddress(value xdr.ScVal) (string, bool) {
+	address, ok := value.GetAddress()
+	if !ok {
+		return "", false
+	}
+	if contract, ok := address.GetContractId(); ok {
+		v, err := strkey.Encode(strkey.VersionByteContract, contract[:])
+		return v, err == nil
+	}
+	if account, ok := address.GetAccountId(); ok {
+		return accountAddress(account), accountAddress(account) != ""
+	}
+	return "", false
+}
+func scValInteger(value xdr.ScVal) (*big.Int, bool) {
+	switch value.Type {
+	case xdr.ScValTypeScvI32:
+		if value.I32 != nil {
+			return big.NewInt(int64(*value.I32)), true
+		}
+	case xdr.ScValTypeScvU32:
+		if value.U32 != nil {
+			return new(big.Int).SetUint64(uint64(*value.U32)), true
+		}
+	case xdr.ScValTypeScvI64:
+		if value.I64 != nil {
+			return big.NewInt(int64(*value.I64)), true
+		}
+	case xdr.ScValTypeScvU64:
+		if value.U64 != nil {
+			return new(big.Int).SetUint64(uint64(*value.U64)), true
+		}
+	case xdr.ScValTypeScvI128:
+		if value.I128 != nil {
+			hi := big.NewInt(int64(value.I128.Hi))
+			hi.Lsh(hi, 64)
+			return hi.Add(hi, new(big.Int).SetUint64(uint64(value.I128.Lo))), true
+		}
+	case xdr.ScValTypeScvU128:
+		if value.U128 != nil {
+			hi := new(big.Int).SetUint64(uint64(value.U128.Hi))
+			hi.Lsh(hi, 64)
+			return hi.Add(hi, new(big.Int).SetUint64(uint64(value.U128.Lo))), true
+		}
+	}
+	return nil, false
 }
 func assetName(a xdr.Asset) string {
 	switch a.Type {

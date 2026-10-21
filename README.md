@@ -187,9 +187,11 @@ prism trades --pair XLM/USDC --follow
 Soroban resource fees, and rolling 10 and 50 ledger transaction fee averages.
 `contracts` reports ledger-key TTL and warns below 1,000 remaining ledgers;
 RPC does not associate TTL key hashes with contract IDs, so TTL changes are
-included even when `--watch` selects contracts. `trades` currently normalizes
-classic strict-send and strict-receive path payments from their executed
-transaction results.
+included even when `--watch` selects contracts. `trades` normalizes classic
+strict-send and strict-receive path payments from transaction results. It also
+recognizes Soroban swap events using `swap`, trader, input asset and output
+asset topics with input and output amounts in the event value. Soroban amounts
+remain raw token units because each contract defines its own decimal scale.
 
 Failed transaction streams include the transaction or operation result code
 inline, for example `failed at op 1 (payment): payment_underfunded`; NDJSON

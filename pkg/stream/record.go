@@ -126,18 +126,19 @@ type FeeStats struct {
 
 // Trade describes a classic or Soroban asset exchange in one operation.
 type Trade struct {
-	Protocol  string `json:"protocol"`
-	TxHash    string `json:"tx"`
-	Trader    string `json:"trader,omitempty"`
-	Maker     string `json:"maker,omitempty"`
-	Taker     string `json:"taker,omitempty"`
-	Operation string `json:"operation"`
-	AssetIn   string `json:"assetIn,omitempty"`
-	AmountIn  string `json:"amountIn,omitempty"`
-	AssetOut  string `json:"assetOut,omitempty"`
-	AmountOut string `json:"amountOut,omitempty"`
-	Price     string `json:"price,omitempty"`
-	OpIndex   uint32 `json:"opIndex"`
+	Protocol   string `json:"protocol"`
+	TxHash     string `json:"tx"`
+	Trader     string `json:"trader,omitempty"`
+	Maker      string `json:"maker,omitempty"`
+	Taker      string `json:"taker,omitempty"`
+	Operation  string `json:"operation"`
+	AssetIn    string `json:"assetIn,omitempty"`
+	AmountIn   string `json:"amountIn,omitempty"`
+	AmountUnit string `json:"amountUnit,omitempty"`
+	AssetOut   string `json:"assetOut,omitempty"`
+	AmountOut  string `json:"amountOut,omitempty"`
+	Price      string `json:"price,omitempty"`
+	OpIndex    uint32 `json:"opIndex"`
 }
 
 // StorageChange is a single contract-related ledger entry mutation extracted

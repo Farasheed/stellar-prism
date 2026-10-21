@@ -53,3 +53,27 @@ func TestTradeSourcePairValidation(t *testing.T) {
 		t.Fatal("malformed pair accepted")
 	}
 }
+
+func TestSorobanSwapEventIsNormalized(t *testing.T) {
+	name := xdr.ScSymbol("swap")
+	traderAccount := xdr.AccountId(xdr.PublicKey{Type: xdr.PublicKeyTypePublicKeyTypeEd25519, Ed25519: &xdr.Uint256{}})
+	traderAddress := xdr.ScAddress{Type: xdr.ScAddressTypeScAddressTypeAccount, AccountId: &traderAccount}
+	inContract, outContract := xdr.ContractId{}, xdr.ContractId{}
+	inContract[0] = 1
+	outContract[0] = 2
+	inAddress := xdr.ScAddress{Type: xdr.ScAddressTypeScAddressTypeContract, ContractId: &inContract}
+	outAddress := xdr.ScAddress{Type: xdr.ScAddressTypeScAddressTypeContract, ContractId: &outContract}
+	topics := []xdr.ScVal{{Type: xdr.ScValTypeScvSymbol, Sym: &name}, {Type: xdr.ScValTypeScvAddress, Address: &traderAddress}, {Type: xdr.ScValTypeScvAddress, Address: &inAddress}, {Type: xdr.ScValTypeScvAddress, Address: &outAddress}}
+	inAmount := xdr.Int128Parts{Lo: 100}
+	outAmount := xdr.Int128Parts{Lo: 250}
+	values := xdr.ScVec{{Type: xdr.ScValTypeScvI128, I128: &inAmount}, {Type: xdr.ScValTypeScvI128, I128: &outAmount}}
+	vec := &values
+	event := xdr.ContractEvent{Type: xdr.ContractEventTypeContract, Body: xdr.ContractEventBody{V: 0, V0: &xdr.ContractEventV0{Topics: topics, Data: xdr.ScVal{Type: xdr.ScValTypeScvVec, Vec: &vec}}}}
+	trade, ok := sorobanSwapTrade(event, "tx", 0)
+	if !ok {
+		t.Fatal("swap event was not recognized")
+	}
+	if trade.Protocol != "soroban" || trade.AmountIn != "100" || trade.AmountOut != "250" || trade.AmountUnit != "raw token units" || trade.Price != "2.50000000" {
+		t.Fatalf("trade = %+v", trade)
+	}
+}

@@ -105,7 +105,20 @@ func (h *Human) emitRecord(r stream.Record) error {
 			return fmt.Errorf("human: trade record %s has no payload", r.ID)
 		}
 		t := r.Trade
-		if _, err := fmt.Fprintf(h.w, "%s  ledger %d  %s %s  %s %s -> %s %s  price %s  trader %s\n", formatTime(r.Time), r.Sequence, t.Protocol, t.Operation, t.AmountIn, t.AssetIn, t.AmountOut, t.AssetOut, t.Price, t.Trader); err != nil {
+		if _, err := fmt.Fprintf(h.w, "%s  ledger %d  %s %s  %s %s -> %s %s  price %s  trader %s", formatTime(r.Time), r.Sequence, t.Protocol, t.Operation, t.AmountIn, t.AssetIn, t.AmountOut, t.AssetOut, t.Price, t.Trader); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
+		if t.Maker != "" {
+			if _, err := fmt.Fprintf(h.w, "  maker %s", t.Maker); err != nil {
+				return fmt.Errorf("human: write: %w", err)
+			}
+		}
+		if t.AmountUnit != "" {
+			if _, err := fmt.Fprintf(h.w, "  (%s)", t.AmountUnit); err != nil {
+				return fmt.Errorf("human: write: %w", err)
+			}
+		}
+		if _, err := h.w.WriteString("\n"); err != nil {
 			return fmt.Errorf("human: write: %w", err)
 		}
 	default:
