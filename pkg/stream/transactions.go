@@ -24,6 +24,10 @@ type TransactionQuery struct {
 	StartLedger uint32
 	// PageLimit is the page size to request.
 	PageLimit uint
+	// Classify decodes each envelope and result to fill Status, FeeAccount,
+	// FeeBump and Failure. It costs two XDR decodes per record, so it is
+	// opt-in; the filtered transaction sources enable it automatically.
+	Classify bool
 }
 
 // TransactionSource streams transactions from RPC.
@@ -109,7 +113,13 @@ func (s *TransactionSource) Fetch(ctx context.Context, cursor string) (Batch, er
 		Full:       uint(len(resp.Transactions)) >= s.query.PageLimit,
 	}
 	for _, tx := range resp.Transactions {
-		batch.Records = append(batch.Records, transactionRecord(tx))
+		record := transactionRecord(tx)
+		if s.query.Classify {
+			if err := EnrichTransaction(record.Transaction); err != nil {
+				return Batch{}, fmt.Errorf("transaction source: %w", err)
+			}
+		}
+		batch.Records = append(batch.Records, record)
 	}
 	return batch, nil
 }

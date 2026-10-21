@@ -68,7 +68,11 @@ pkg/stream/
   tail.go             the state machine
   events.go           contract events source
   ledgers.go          ledger close source
-  transactions.go     transaction source
+  transactions.go     transaction source and opt-in classification
+  tx_status.go        status/failure decoding and the filtered tx source
+  traps.go            Soroban trap predicate and trap source
+  feebump.go          fee-bump classification and fee-account filters
+  dedup.go            bounded ring-buffer de-duplication for re-polls
   storage_changes.go  contract storage mutations (from tx meta)
   wasm_events.go      WASM uploads and contract deployments
   pool.go             multi-endpoint failover RPC client
@@ -216,6 +220,22 @@ rather than wedging the other contracts. `Close` after the tailer stops
 drains everything the caller accepted, closes each queue from the dispatcher
 —the only closer, after its last send — flushes, and waits on every goroutine,
 so a fanout run terminates with no leaked goroutines and a joined error.
+
+### Re-poll de-duplication
+
+`--dedup-window N` wraps the event sink in `stream.DedupSink`, which
+suppresses a record whose fingerprint was already emitted within the last `N`
+keys. The window is a fixed-size ring (`dedup.go`): the oldest key is evicted
+when a new one arrives, so memory is bounded by count rather than by traffic
+or elapsed time, and a hot contract cannot grow it without bound. A zero
+window disables the wrapper entirely.
+
+The fingerprint prefers the server's event ID, because a re-poll after a
+reconnect replays the same ID while two genuinely distinct events can carry
+byte-identical topics and values. Records without an ID fall back to a
+content hash over the event locator and payload. De-duplication lives at the
+sink seam, like pattern filtering, so the cursor still advances across a
+suppressed record and the tailer's delivery guarantee is unchanged.
 
 ### Adaptive polling
 
@@ -429,6 +449,41 @@ network, so `--network-passphrase` must match the chain being streamed
 Both sources synthesise fixed-width zero-padded IDs (`%010d-%06d-…`) from
 the ledger sequence, preserving the lexicographic-order contract the tailer
 depends on.
+
+### Transaction classification (`prism transactions`)
+
+`TransactionSource` accepts `TransactionQuery.Classify`, which fills four
+derived fields on each record by decoding the envelope and result through
+lens: `Status` (`success` or `failed`), `FeeAccount`, `FeeBump` and
+`Failure`. Classification is opt-in because it costs two XDR decodes per
+record; the filtered streams enable it automatically.
+
+`Failure` keeps every level at which the protocol reports a reason, because
+the most specific level is not always the one a consumer wants:
+
+- `Detail` is the transaction-level code (`tx_failed`, `tx_bad_seq`, …).
+- `Inner` is the inner transaction's code for a fee-bump wrapper, which is
+  almost always the real cause.
+- `Operation` is the first failing operation, with its own decoded code. A
+  Soroban host function that trapped or panicked appears here as
+  `invoke_host_function_trapped`, and `Failure.Trapped()` reports it.
+
+`TransactionFilterSource` wraps a classified `TransactionSource` and applies
+a status set plus zero or more `TransactionFilter` predicates after each page
+is fetched. Filtering therefore advances the cursor across suppressed
+records: `--status failed`, `--trapped`, `--fee-bump` and `--fee-account` are
+views of one stream, not separate streams that could skip history. `traps.go`
+exposes `TrappedFilter`/`NewTrapSource` for contract executions that trapped,
+which is distinct from a malformed invocation or an exceeded resource limit.
+`feebump.go` exposes `FeeBumpFilter`, `FeeAccountFilter` (which normalises a
+muxed address to its underlying account) and the `FeeBump` classification,
+which keeps the wrapper's fee payer, inner source, inner hash, fee bids and
+signature counts separate from the inner transaction.
+
+`prism transactions` always classifies, so the JSON line carries `status`,
+`feeAccount`, and `failure`/`feeBump` objects when they apply. The human sink
+names the failed operation and prints "contract execution trapped or
+panicked" for a trap.
 
 ## Cursor metadata and background pruning (`pkg/stream/pruning.go`)
 

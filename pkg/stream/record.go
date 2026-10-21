@@ -101,6 +101,20 @@ type Transaction struct {
 	ResultXDR string
 	// ResultMetaXDR is the base64 TransactionMeta.
 	ResultMetaXDR string
+
+	// Status is "success" or "failed" once the transaction has been
+	// classified. It is empty on a record produced without
+	// TransactionQuery.Classify, which is what the derived sources use.
+	Status string
+	// FeeAccount is the strkey account that paid the fee: the fee-bump
+	// source for a wrapped transaction, and the transaction's own source
+	// otherwise. It is set during classification.
+	FeeAccount string
+	// FeeBump is set when the transaction envelope is a FeeBumpTransaction.
+	FeeBump *FeeBump
+	// Failure explains a failed transaction's decoded result. It is nil for
+	// a successful transaction and for an unclassified record.
+	Failure *Failure
 }
 
 // StorageChange is a single contract-related ledger entry mutation extracted
