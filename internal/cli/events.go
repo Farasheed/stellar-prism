@@ -24,6 +24,7 @@ import (
 type streamFlags struct {
 	follow           bool
 	from             uint32
+	since            time.Duration
 	limit            int
 	asJSON           bool
 	raw              bool
@@ -31,6 +32,7 @@ type streamFlags struct {
 	poll             time.Duration
 	pageSize         uint
 	retries          int
+	adaptive         bool
 	backfillWorkers  int
 	batch            bool
 	batchSize        int
@@ -60,6 +62,11 @@ type streamFlags struct {
 	// runs share a key only when they watch the same thing, so a recorded
 	// cursor is never applied to a different set of filters.
 	stateKey string
+
+	// topicPatterns and fanoutDir are events-only; the other commands leave
+	// them empty, which is what keeps runStream generic.
+	topicPatterns []string
+	fanoutDir     string
 }
 
 func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
@@ -67,6 +74,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"keep streaming as new ledgers close, like tail -f")
 	cmd.Flags().Uint32Var(&s.from, "from", 0,
 		"start from this ledger and continue forward (default: the latest ledger)")
+	cmd.Flags().DurationVar(&s.since, "since", 0,
+		"start about this long ago, e.g. --since 10m; converted to an approximate start ledger (mutually exclusive with --from)")
 	cmd.Flags().IntVarP(&s.limit, "limit", "n", 0,
 		"stop after this many records (0 means unlimited)")
 	cmd.Flags().BoolVar(&s.asJSON, "json", false,
@@ -81,6 +90,8 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 		"how many records to request per RPC call")
 	cmd.Flags().IntVar(&s.retries, "max-retries", 0,
 		"give up after this many consecutive RPC failures (0 means never give up)")
+	cmd.Flags().BoolVar(&s.adaptive, "adaptive", false,
+		"tune the wait between polls from how many new ledgers close each interval (with --follow)")
 	cmd.Flags().IntVar(&s.backfillWorkers, "backfill-workers", 1,
 		"fetch historical pages concurrently with this many workers when --from is set (1 means sequential)")
 	cmd.Flags().BoolVar(&s.batch, "batch", false,
@@ -124,6 +135,14 @@ func (s *streamFlags) register(cmd *cobra.Command, defaultPage uint) {
 // cmd is required: it is what tells an explicitly-set flag apart from one
 // that is merely carrying its default.
 func (s *streamFlags) validate(cmd *cobra.Command) error {
+	if cmd.Flags().Changed("since") {
+		if s.from != 0 {
+			return fmt.Errorf("--from and --since are mutually exclusive; pass only one")
+		}
+		if s.since < 0 {
+			return fmt.Errorf("--since must not be negative")
+		}
+	}
 	if s.backfillWorkers < 1 {
 		return fmt.Errorf("--backfill-workers must be at least 1")
 	}
@@ -313,10 +332,14 @@ func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, err
 	}
 
 	return stream.Options{
-		Follow:           s.follow,
-		Limit:            s.limit,
-		PollInterval:     s.poll,
-		MaxRetries:       s.retries,
+		Follow:       s.follow,
+		Limit:        s.limit,
+		PollInterval: s.poll,
+		MaxRetries:   s.retries,
+		// Adaptive switches the follow loop to the adaptive poller. Its bounds
+		// stay zero so the tailer fills the documented defaults in; the CLI
+		// keeps its flag surface to one switch.
+		Adaptive:         s.adaptive,
 		GapStrategy:      strategy,
 		MaxGapRecoveries: s.maxGapRecoveries,
 		OnRetry: func(attempt int, delay time.Duration, err error) {
@@ -336,6 +359,30 @@ func (s *streamFlags) options(stderr io.Writer, quiet bool) (stream.Options, err
 			}
 		},
 	}, nil
+}
+
+// resolveSince converts the --since window into an approximate start ledger
+// against the server's reported head. It returns zero when --since was not
+// passed, leaving the caller to apply its own default: --from, a recorded
+// cursor, or the server's head.
+//
+// The window is resolved against the head at the moment of the call, so the
+// ledger it names is genuinely "that long ago" rather than that long ago
+// whenever the stream happened to start.
+func (s *streamFlags) resolveSince(cmd *cobra.Command, client rpc.Client, stderr io.Writer) (uint32, error) {
+	if !cmd.Flags().Changed("since") {
+		return 0, nil
+	}
+	latest, err := latestLedger(cmd.Context(), client)
+	if err != nil {
+		return 0, err
+	}
+	start := stream.StartLedgerForWindow(latest, s.since)
+	// The resolution is informational and approximate by design, so say
+	// so on stderr, where it never contaminates a piped --json stream.
+	fmt.Fprintf(stderr, "prism: --since %s resolves to start ledger %d (head %d, assuming a %s ledger cadence)\n",
+		s.since, start, latest, stream.RoughLedgerCloseInterval)
+	return start, nil
 }
 
 func newEventsCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
@@ -414,6 +461,12 @@ start the next run where the last one stopped.`,
 		`topic filter as comma-separated base64 ScVals, with "*" and "**" wildcards; repeatable, up to 5`)
 	cmd.Flags().StringSliceVar(&eventTypes, "type", nil,
 		"event type to include: contract, system or diagnostic (default: all)")
+	// StringArray, not StringSlice: a comma separates segment *patterns*
+	// within one filter, which StringSlice's comma-splitting would destroy.
+	cmd.Flags().StringArrayVar(&sf.topicPatterns, "topic-pattern", nil,
+		`client-side topic pattern as comma-separated segments over decoded topics: "*", "**", "prefix:TEXT", "re:REGEX", or plain text with "*" and "?" globs; repeatable, up to 5`)
+	cmd.Flags().StringVar(&sf.fanoutDir, "fanout-dir", "",
+		"write each watched contract's events to its own NDJSON file in this directory, in addition to the main output")
 	sf.register(cmd, stream.DefaultPageLimit)
 	registerFlagCompletion(cmd, "type", "contract", "system", "diagnostic")
 	registerFlagCompletion(cmd, "gap-strategy", string(stream.GapFail), string(stream.GapResume))
@@ -525,6 +578,32 @@ func runStream(
 		}()
 	}
 
+	if len(sf.topicPatterns) > 0 {
+		patterns, err := stream.CompileTopicPatterns(sf.topicPatterns)
+		if err != nil {
+			return err
+		}
+		out = stream.NewPatternSink(out, patterns)
+	}
+
+	// The fanout shares this stream's records: the demux inside writes one
+	// NDJSON file per contract while stdout keeps the combined stream.
+	var fan *fanoutSink
+	if sf.fanoutDir != "" {
+		f, err := newFanoutSink(sf.fanoutDir)
+		if err != nil {
+			return err
+		}
+		fan = f
+		out = &teeSink{main: out, second: fan}
+		defer func() {
+			// Wind the demux down whatever happened above: it drains, flushes
+			// and closes every per-contract file, and joins any sink error
+			// with err so a fanout failure still fails the command.
+			err = errors.Join(err, fan.finish())
+		}()
+	}
+
 	// The cursor metadata file is opened before the stream starts, so a
 	// recorded cursor is known before the first fetch and the pruner is
 	// running for the whole of the run.
@@ -542,10 +621,20 @@ func runStream(
 	if err != nil {
 		return err
 	}
+	// --since is an explicit position like --from, so it is resolved here and
+	// overrides whatever the caller passed.
+	since, err := sf.resolveSince(cmd, client, stderr)
+	if err != nil {
+		return err
+	}
+	if since != 0 {
+		from = since
+	}
+
 	if state != nil {
-		// An explicit --from wins over a recorded cursor: the operator
-		// asked for a position, so it is the position that counts.
-		if sf.from == 0 {
+		// An explicit --from or --since wins over a recorded cursor: the
+		// operator asked for a position, so it is the position that counts.
+		if from == 0 {
 			opts.StartCursor = state.cursor
 		}
 		opts.OnPage = func(page stream.Page) {
@@ -566,7 +655,7 @@ func runStream(
 		startFrom = latest
 	}
 
-	if sf.from > 0 && sf.backfillWorkers > 1 {
+	if from > 0 && sf.backfillWorkers > 1 {
 		drainer, err := stream.NewDrainer(stream.DrainerConfig{
 			NewSource:        newSource,
 			Sink:             out,

@@ -60,7 +60,9 @@ returns — there is no polling loop, no cursor advancement, no reconnection, an
 | **Follow as ledgers close** | ❌ | ✅ |
 | **Cursor continuity across polls** | ❌ | ✅ |
 | **Reconnect with backoff** | ❌ | ✅ |
+| **Adaptive poll rate** | ❌ | ✅ (`--adaptive`) |
 | **NDJSON for pipelines** | ❌ | ✅ |
+| **Per-contract fan-out** | ❌ | ✅ (`--fanout-dir`) |
 | **Gap detection** | ❌ | ✅ |
 | Ledger streaming | ❌ | ✅ |
 | Contract-spec-decoded payloads | ✅ **better** | ❌ ([roadmap](docs/roadmap.md)) |
@@ -85,6 +87,9 @@ prism events --contract CDLZF...CYSC --follow
 # Backfill from a ledger, then keep following
 prism events --contract CDLZF...CYSC --from 3966000 --follow
 
+# Start about ten minutes back, without picking a ledger
+prism events --contract CDLZF...CYSC --since 10m --follow
+
 # Filter by topic, using the server's wildcard syntax
 prism events --topic 'AAAADwAAAANmZWUA,*' --limit 20
 ```
@@ -92,6 +97,32 @@ prism events --topic 'AAAADwAAAANmZWUA,*' --limit 20
 Topic filters are evaluated by the RPC server with the same semantics as
 `stellar events --topic`: `*` matches exactly one segment, `**` matches zero or
 more and must come last.
+
+`--since` converts a relative window into an approximate start ledger (ledgers
+close roughly every 5s; the window rounds up, so it never starts late). For
+topics, `--topic-pattern` matches their **decoded** text rather than base64
+XDR, with glob, prefix and regex segments:
+
+```sh
+# Any topic whose first segment starts with "transfer" (e.g. a symbol)
+prism events --topic-pattern 'prefix:transfer' --limit 20
+
+# Regex over the decoded topic text
+prism events --contract CBGSB... --topic-pattern 're:burn.*' --follow
+
+# Watch several contracts and split them into per-contract NDJSON files
+prism events --contract CDLZF... --contract CDLZA... --fanout-dir events/ --follow
+
+# Let the follow loop tune its own poll rate from observed ledger closes
+prism events --contract CDLZF... --follow --adaptive
+```
+
+`--fanout-dir` writes one NDJSON file per watched contract under the
+directory (streamed through a per-contract demux with bounded queues), while
+the terminal keeps the combined stream. `--adaptive` replaces the fixed
+`--poll` wait with a tuner whose only signal is how many ledgers closed
+during the last wait, so it tracks the network's own cadence between 1s and
+30s, jittered so several instances do not poll in phase.
 
 ### Batched output and parallel backfill
 
