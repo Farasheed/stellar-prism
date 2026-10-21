@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -12,6 +13,7 @@ import (
 func newTransactionsCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 	var (
 		sf          streamFlags
+		memo        string
 		statuses    []string
 		trapped     bool
 		feeBump     bool
@@ -77,6 +79,12 @@ start the next run where the last one stopped.`,
 				return err
 			}
 
+			if memo != "" {
+				filters = append(filters, func(tx *stream.Transaction) bool {
+					return tx.Memo != nil && tx.Memo.Type == "text" && strings.HasPrefix(tx.Memo.Value, memo)
+				})
+			}
+
 			client, closeClient, err := openClient(g, stderr)
 			if err != nil {
 				return err
@@ -88,6 +96,7 @@ start the next run where the last one stopped.`,
 			// a differently filtered stream.
 			sf.stateKey = stateKey("transactions",
 				filterPart("status", statuses),
+				boolPart(memo != "", "memo="+memo),
 				filterPart("fee-account", feeAccounts),
 				boolPart(trapped, "trapped"),
 				boolPart(feeBump, "fee-bump"))
@@ -111,6 +120,7 @@ start the next run where the last one stopped.`,
 		},
 	}
 
+	cmd.Flags().StringVar(&memo, "memo", "", "include transactions whose sanitized text memo starts with this text")
 	cmd.Flags().StringSliceVar(&statuses, "status", nil,
 		"only emit transactions with this status: success or failed (repeatable; default: all)")
 	cmd.Flags().BoolVar(&trapped, "trapped", false,

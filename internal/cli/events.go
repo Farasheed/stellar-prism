@@ -549,6 +549,8 @@ start the next run where the last one stopped.`,
 
 func newLedgersCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 	var sf streamFlags
+	var consensus bool
+	var expected []string
 
 	cmd := &cobra.Command{
 		Use:   "ledgers",
@@ -565,6 +567,12 @@ start the next run where the last one stopped.`,
   prism ledgers --from 1234567 --limit 5 --json`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(expected) > 0 && !consensus {
+				return fmt.Errorf("--expected-validator requires --consensus")
+			}
+			if consensus && sf.backfillWorkers > 1 {
+				return fmt.Errorf("--consensus requires --backfill-workers 1 for consecutive close deltas")
+			}
 			if err := sf.validate(cmd); err != nil {
 				return err
 			}
@@ -579,14 +587,18 @@ start the next run where the last one stopped.`,
 
 			newSource := func(startLedger uint32) (stream.Source, error) {
 				return stream.NewLedgerSource(client, stream.LedgerQuery{
-					StartLedger: startLedger,
-					PageLimit:   sf.pageSize,
+					StartLedger:        startLedger,
+					PageLimit:          sf.pageSize,
+					Consensus:          consensus,
+					ExpectedValidators: expected,
 				}), nil
 			}
 			return runStream(cmd, client, newSource, sf.from, &sf, g, stdout, stderr)
 		},
 	}
 
+	cmd.Flags().BoolVar(&consensus, "consensus", false, "extract signed consensus value and close delta diagnostics (headers do not prove quorum health)")
+	cmd.Flags().StringSliceVar(&expected, "expected-validator", nil, "expected value signer address; repeatable, requires --consensus")
 	sf.register(cmd, stream.DefaultLedgerPageLimit)
 	registerFlagCompletion(cmd, "gap-strategy", string(stream.GapFail), string(stream.GapResume))
 	return cmd
@@ -622,6 +634,13 @@ func runStream(
 	// partially written line never reaches a downstream consumer.
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	defer func() {
+		if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
+			err = cause
+		}
+	}()
 
 	// Diagnostics come from more than one goroutine: the stream reports
 	// retries and gaps, and the background cursor pruner reports what it
@@ -642,7 +661,17 @@ func runStream(
 	if err != nil {
 		return err
 	}
-	if closer, ok := out.(io.Closer); ok {
+	localOut := out
+	var shutdown func()
+	out, shutdown, err = startBroadcasts(ctx, g, out, stderr, cancel)
+	if err != nil {
+		if closer, ok := localOut.(io.Closer); ok {
+			_ = closer.Close()
+		}
+		return err
+	}
+	defer shutdown()
+	if closer, ok := localOut.(io.Closer); ok {
 		defer func() {
 			// A failure to close the output is joined with whatever else
 			// went wrong rather than replacing it: two causes are more
