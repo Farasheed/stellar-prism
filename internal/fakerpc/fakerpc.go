@@ -383,6 +383,105 @@ func (s *Server) GetEvents(ctx context.Context, req protocol.GetEventsRequest) (
 	return respond(out), nil
 }
 
+// GetEventsBatch implements rpc.Client.
+func (s *Server) GetEventsBatch(ctx context.Context, reqs []protocol.GetEventsRequest) ([]protocol.GetEventsResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(reqs) == 0 {
+		return nil, nil
+	}
+
+	responses := make([]protocol.GetEventsResponse, 0, len(reqs))
+	for i, req := range reqs {
+		call := s.calls + i
+		s.calls++
+		b := s.script[call]
+
+		if b.Err != nil {
+			return protocol.GetEventsResponse{}, b.Err
+		}
+
+		hasCursor := req.Pagination != nil && req.Pagination.Cursor != nil
+		if hasCursor && req.StartLedger != 0 {
+			return protocol.GetEventsResponse{}, errors.New("ledger ranges and cursor cannot both be set")
+		}
+
+		oldest, latest := s.oldest, s.latest
+		if b.OldestLedger != 0 {
+			oldest = b.OldestLedger
+		}
+		if b.LatestLedger != 0 {
+			latest = b.LatestLedger
+		}
+
+		respond := func(page []protocol.EventInfo) protocol.GetEventsResponse {
+			s.lastEvents = page
+			resp := protocol.GetEventsResponse{
+				Events:       page,
+				LatestLedger: latest,
+				OldestLedger: oldest,
+			}
+			if len(page) > 0 {
+				resp.Cursor = page[len(page)-1].ID
+			} else if hasCursor {
+				resp.Cursor = req.Pagination.Cursor.String()
+			}
+			return resp
+		}
+
+		if b.Empty {
+			return respond(nil), nil
+		}
+		if b.ReplayLast {
+			return respond(s.lastEvents), nil
+		}
+
+		// Select everything strictly after the cursor, or from the start ledger.
+		var out []protocol.EventInfo
+		for _, e := range s.events {
+			if hasCursor {
+				if e.ID > req.Pagination.Cursor.String() {
+					out = append(out, e)
+				}
+				continue
+			}
+			if req.StartLedger == 0 || uint32(e.Ledger) >= req.StartLedger { //nolint:gosec // test data
+				out = append(out, e)
+			}
+		}
+
+		limit := s.pageLimit
+		if req.Pagination != nil && req.Pagination.Limit > 0 && int(req.Pagination.Limit) < limit {
+			limit = int(req.Pagination.Limit)
+		}
+		if len(out) > limit {
+			out = out[:limit]
+		}
+
+		if b.Reorder {
+			reversed := make([]protocol.EventInfo, len(out))
+			copy(reversed, out)
+			sort.Slice(reversed, func(i, j int) bool { return reversed[i].ID > reversed[j].ID })
+			// Cursor still reflects the true high-water mark; only the page order
+			// is wrong, which is exactly the hazard being simulated.
+			s.lastEvents = reversed
+			resp := protocol.GetEventsResponse{
+				Events:       reversed,
+				LatestLedger: latest,
+				OldestLedger: oldest,
+			}
+			if len(out) > 0 {
+				resp.Cursor = out[len(out)-1].ID
+			}
+			return resp, nil
+		}
+
+		return respond(out), nil
+	}
+	return responses, nil
+}
+
 // GetLedgers implements rpc.Client.
 func (s *Server) GetLedgers(ctx context.Context, req protocol.GetLedgersRequest) (protocol.GetLedgersResponse, error) {
 	s.mu.Lock()

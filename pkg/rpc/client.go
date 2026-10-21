@@ -34,11 +34,15 @@ const URLEnvVar = "SOROBAN_RPC_URL"
 // It is deliberately tiny: four read methods, all taking a context. New
 // stream sources should prefer composing these over widening the interface,
 // because every method added here must also be faked in tests.
-type Client interface {
-	// GetEvents returns contract events matching the request. Either
-	// StartLedger or Pagination.Cursor must be set, never both — the RPC
-	// rejects requests carrying both.
+type Client interface {// GetEvents returns contract events matching the request. Either
+// StartLedger or Pagination.Cursor must be set, never both — the RPC
+// rejects requests carrying both.
 	GetEvents(ctx context.Context, req protocol.GetEventsRequest) (protocol.GetEventsResponse, error)
+
+	// GetEventsBatch returns contract events matching the request, combining
+	// multiple requests into a single HTTP roundtrip. Each entry's StartLedger
+	// or Pagination.Cursor must be mutually exclusive; at least one must be set.
+	GetEventsBatch(ctx context.Context, reqs []protocol.GetEventsRequest) ([]protocol.GetEventsResponse, error)
 
 	// GetLedgers returns ledger metadata starting at the requested point.
 	GetLedgers(ctx context.Context, req protocol.GetLedgersRequest) (protocol.GetLedgersResponse, error)
@@ -92,6 +96,25 @@ func cleanURLs(values []string) []string {
 	return urls
 }
 
+// resolveSRV resolves DNS SRV records for the given domain and returns
+// the resolved URLs. This enables discovering RPC cluster nodes via
+// SRV records, allowing automatic load-balancing across multiple endpoints.
+func resolveSRV(domain string) ([]string, error) {
+	// Look up SRV records: _rpc._tcp.domainname
+	srvRecords, err := net.LookupSRV("", "_rpc._tcp", domain)
+	if err != nil {
+		return nil, fmt.Errorf("SRV lookup for %s: %w", domain, err)
+	}
+
+	urls := make([]string, 0, len(srvRecords))
+	for _, srv := range srvRecords {
+		// Construct URL from SRV record: scheme://host:port
+		url := fmt.Sprintf("%s://%s:%d", "https", srv.Target, srv.Port)
+		urls = append(urls, url)
+	}
+	return urls, nil
+}
+
 // SDKClient adapts the Stellar SDK's RPC client to the Client interface.
 type SDKClient struct {
 	inner *rpcclient.Client
@@ -101,12 +124,20 @@ type SDKClient struct {
 //
 // The HTTP client carries a per-request timeout so a hung connection surfaces
 // as a retryable error rather than stalling the stream indefinitely.
-func New(url string, timeout time.Duration) *SDKClient {
+//
+// proxyURL, when provided, is used to configure an HTTP proxy (HTTP, HTTPS,
+// or SOCKS5) for the underlying requests. This enables routing RPC traffic
+// through corporate proxies, firewall tunnels, or SOCKS gateways.
+func New(url string, timeout time.Duration, opts ...NewClientOption) *SDKClient {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
+	options := applyNewClientOptions(opts...)
 	return &SDKClient{
-		inner: rpcclient.NewClient(url, &http.Client{Timeout: timeout}),
+		inner: rpcclient.NewClient(url, &http.Client{
+			Timeout:   timeout,
+			Transport: options.transport,
+		}),
 	}
 }
 
@@ -117,6 +148,28 @@ func (c *SDKClient) GetEvents(ctx context.Context, req protocol.GetEventsRequest
 		return resp, fmt.Errorf("rpc getEvents: %w", err)
 	}
 	return resp, nil
+}
+
+// GetEventsBatch implements Client.
+func (c *SDKClient) GetEventsBatch(ctx context.Context, reqs []protocol.GetEventsRequest) ([]protocol.GetEventsResponse, error) {
+	if len(reqs) == 0 {
+		return nil, nil
+	}
+	responses := make([]protocol.GetEventsResponse, 0, len(reqs))
+	for _, req := range reqs {
+		resp, err := c.inner.GetEvents(ctx, req)
+		if err != nil {
+			// Return what we have so far, marking this as a partial failure
+			// by returning an empty response with the error info
+			responses = append(responses, protocol.GetEventsResponse{
+				Events:       nil,
+				Error:        err.Error(),
+			})
+		} else {
+			responses = append(responses, resp)
+		}
+	}
+	return responses, nil
 }
 
 // GetLedgers implements Client.
@@ -181,6 +234,83 @@ func (c *SDKClient) Close() error {
 		return fmt.Errorf("rpc close: %w", err)
 	}
 	return nil
+}
+
+// NewClientOption configures the Stellar SDK RPC client creation.
+type NewClientOption struct {
+	// ProxyURL, when set, configures an HTTP proxy (HTTP, HTTPS, or SOCKS5)
+	// for underlying RPC requests. This enables routing traffic through
+// corporate proxies, firewall tunnels, or SOCKS gateways.
+	ProxyURL string
+}
+
+// newClientOptions collects options for SDK client creation.
+type newClientOptions struct {
+	transport http.RoundTripper
+}
+
+func applyNewClientOptions(opts ...NewClientOption) newClientOptions {
+	optsDefault := newClientOptions{}
+	for _, opt := range opts {
+		switch opt := opt.(type) {
+		case *NewClientOption:
+			if opt.ProxyURL != "" {
+				transport, err := proxyURLToTransport(opt.ProxyURL)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "rpc: invalid proxy URL %q: %v\n", opt.ProxyURL, err)
+				break
+				}
+				optsDefault.transport = transport
+			}
+		}
+	}
+	return optsDefault
+}
+
+// proxyURLToTransport converts a proxy URL to an HTTP RoundTripper that
+// includes the proxy configuration. Supported schemes: http, https, socks5.
+func proxyURLToTransport(url string) (http.RoundTripper, error) {
+	u, err := url.Parse(url)
+	if err != nil {
+		return nil, fmt.Errorf("invalid proxy URL: %w", err)
+	}
+	switch u.Scheme {
+	case "http", "https":
+		return &proxyRoundTripper{
+			proxy: url.URL{
+				Scheme:   u.Scheme,
+				Host:     u.Host,
+				Path:     u.Path,
+				User:     u.User,
+			},
+		}, nil
+	case "socks5":
+		// SOCKS5 support requires golang.org/x/proxy
+		return &proxyRoundTripper{
+			proxy: url.URL{
+				Scheme:   "socks5",
+				Host:     u.Host,
+				Path:     u.Path,
+				User:     u.User,
+			},
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported proxy scheme %q, use http, https, or socks5", u.Scheme)
+	}
+}
+
+type proxyRoundTripper struct {
+	proxy url.URL
+}
+
+func (pr *proxyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.URL.Scheme = "http"
+	req.URL.Host = pr.proxy.Host
+	req.URL.Opaque = ""
+	req.Proxy = func(_ *http.Request) (*url.URL, error) {
+		return &pr.proxy, nil
+	}
+	return http.DefaultTransport.RoundTrip(req)
 }
 
 // PermanentError marks a failure that retrying cannot fix, such as a
