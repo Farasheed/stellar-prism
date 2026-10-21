@@ -129,3 +129,63 @@ func TestBoundedFollowDrainsBufferedRecordsAtHead(t *testing.T) {
 		t.Fatalf("bounded follow waited for another ledger: emitted=%d, sleeps=%d", tailer.Stats().Emitted, len(clock.slept))
 	}
 }
+
+type reorderedPageFilter func(stream.Record) (bool, error)
+
+func (f reorderedPageFilter) Match(r stream.Record) (bool, error) { return f(r) }
+
+func TestReorderedCheckpointsCountOnlyMatchingRecords(t *testing.T) {
+	t.Parallel()
+	src := &replaySource{batches: []stream.Batch{
+		{Records: []stream.Record{{ID: "0000000010-02", Sequence: 10}}, NextCursor: "page-1", Full: true},
+		{Records: []stream.Record{{ID: "0000000010-01", Sequence: 10}}, NextCursor: "page-2", Full: true},
+		{Records: []stream.Record{{ID: "0000000011-01", Sequence: 11}}, NextCursor: "page-3"},
+	}}
+	var pages []stream.Page
+	sink := &collector{}
+	tailer := stream.NewTailer(src, sink, stream.Options{
+		Filter: reorderedPageFilter(func(r stream.Record) (bool, error) {
+			return r.ID == "0000000010-02", nil
+		}),
+		OnPage: func(p stream.Page) { pages = append(pages, p) },
+	})
+	if err := tailer.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(pages) != 3 {
+		t.Fatalf("got %d checkpoints, want 3", len(pages))
+	}
+	for i, want := range []int{1, 0, 0} {
+		if pages[i].Records != want {
+			t.Errorf("page %d delivered %d records, want %d", i, pages[i].Records, want)
+		}
+	}
+	if tailer.Cursor() != "page-3" || tailer.Stats().Emitted != 1 || tailer.Stats().Filtered != 2 {
+		t.Fatalf("cursor=%s stats=%+v", tailer.Cursor(), tailer.Stats())
+	}
+}
+
+func TestFilteredCheckpointSurvivesLaterFilterFailure(t *testing.T) {
+	t.Parallel()
+	wantErr := errors.New("invalid filter value")
+	src := &replaySource{batches: []stream.Batch{
+		{Records: []stream.Record{{ID: "0000000010-01", Sequence: 10}}, NextCursor: "page-1", Full: true},
+		{Records: []stream.Record{{ID: "0000000011-01", Sequence: 11}}, NextCursor: "page-2"},
+	}}
+	var pages []stream.Page
+	tailer := stream.NewTailer(src, &collector{}, stream.Options{
+		Filter: reorderedPageFilter(func(r stream.Record) (bool, error) {
+			if r.Sequence == 11 {
+				return false, wantErr
+			}
+			return false, nil
+		}),
+		OnPage: func(p stream.Page) { pages = append(pages, p) },
+	})
+	if err := tailer.Run(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("Run() = %v, want %v", err, wantErr)
+	}
+	if len(pages) != 1 || pages[0].Records != 0 || tailer.Cursor() != "page-1" {
+		t.Fatalf("pages=%v cursor=%s, want only the fully filtered page", pages, tailer.Cursor())
+	}
+}

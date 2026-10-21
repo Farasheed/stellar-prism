@@ -56,19 +56,22 @@ func NewNDJSON(w io.Writer, decode bool) *NDJSON {
 
 // eventLine is the documented NDJSON shape for an event.
 type eventLine struct {
-	Kind       string            `json:"kind"`
-	ID         string            `json:"id"`
-	Ledger     uint32            `json:"ledger"`
-	Time       string            `json:"time,omitempty"`
-	Type       string            `json:"type,omitempty"`
-	ContractID string            `json:"contract,omitempty"`
-	TxHash     string            `json:"tx,omitempty"`
-	TxIndex    uint32            `json:"txIndex"`
-	OpIndex    uint32            `json:"opIndex"`
-	Topics     []json.RawMessage `json:"topics,omitempty"`
-	Value      json.RawMessage   `json:"value,omitempty"`
-	TopicsXDR  []string          `json:"topicsXdr,omitempty"`
-	ValueXDR   string            `json:"valueXdr,omitempty"`
+	Kind             string            `json:"kind"`
+	ID               string            `json:"id"`
+	Ledger           uint32            `json:"ledger"`
+	Time             string            `json:"time,omitempty"`
+	Type             string            `json:"type,omitempty"`
+	ContractID       string            `json:"contract,omitempty"`
+	TxHash           string            `json:"tx,omitempty"`
+	TxIndex          uint32            `json:"txIndex"`
+	OpIndex          uint32            `json:"opIndex"`
+	CallDepth        int               `json:"callDepth,omitempty"`
+	ParentContractID string            `json:"parentContract,omitempty"`
+	InvocationPath   []string          `json:"invocationPath,omitempty"`
+	Topics           []json.RawMessage `json:"topics,omitempty"`
+	Value            json.RawMessage   `json:"value,omitempty"`
+	TopicsXDR        []string          `json:"topicsXdr,omitempty"`
+	ValueXDR         string            `json:"valueXdr,omitempty"`
 }
 
 // ledgerLine is the documented NDJSON shape for a ledger close.
@@ -258,6 +261,9 @@ func (n *NDJSON) encode(r stream.Record) error {
 			line.Type = r.Event.Type
 			line.ContractID = r.Event.ContractID
 			line.TxHash = r.Event.TxHash
+			line.CallDepth = r.Event.CallDepth
+			line.ParentContractID = r.Event.ParentContractID
+			line.InvocationPath = r.Event.InvocationPath
 
 			if n.decode {
 				for _, t := range r.Event.TopicXDR {

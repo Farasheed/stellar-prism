@@ -85,6 +85,14 @@ type Event struct {
 	TopicXDR []string
 	// ValueXDR is the base64 ScVal payload.
 	ValueXDR string
+	// CallDepth is the zero-based invocation depth when call trace metadata is
+	// available. RPC getEvents currently omits this trace and leaves it zero.
+	CallDepth int
+	// ParentContractID identifies the immediate caller when known.
+	ParentContractID string
+	// InvocationPath lists the contract IDs from the root invocation to the
+	// contract that emitted this event, when known.
+	InvocationPath []string
 }
 
 // LedgerClose is ledger close metadata as delivered by RPC.
