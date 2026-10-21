@@ -12,12 +12,13 @@ import (
 
 func newTransactionsCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 	var (
-		sf          streamFlags
-		memo        string
-		statuses    []string
-		trapped     bool
-		feeBump     bool
-		feeAccounts []string
+		detectConflicts bool
+		sf              streamFlags
+		memo            string
+		statuses        []string
+		trapped         bool
+		feeBump         bool
+		feeAccounts     []string
 	)
 
 	cmd := &cobra.Command{
@@ -95,6 +96,7 @@ start the next run where the last one stopped.`,
 			// records come out, so a resumed run never applies a position from
 			// a differently filtered stream.
 			sf.stateKey = stateKey("transactions",
+				boolPart(detectConflicts, "detect-conflicts"),
 				filterPart("status", statuses),
 				boolPart(memo != "", "memo="+memo),
 				filterPart("fee-account", feeAccounts),
@@ -116,6 +118,14 @@ start the next run where the last one stopped.`,
 					Filters:     filters,
 				})
 			}
+			if detectConflicts {
+				analyzer := stream.NewFootprintAnalyzer()
+				sf.process = analyzer.Analyze
+				// Conflict analysis needs complete same-ledger transaction sets;
+				// concurrent range workers would merge directly into the sink and
+				// bypass the Tailer's ledger reorder/processing stage.
+				sf.backfillWorkers = 1
+			}
 			return runStream(cmd, client, newSource, sf.from, &sf, g, stdout, stderr)
 		},
 	}
@@ -130,6 +140,8 @@ start the next run where the last one stopped.`,
 	cmd.Flags().StringSliceVar(&feeAccounts, "fee-account", nil,
 		"only emit transactions whose fee was paid by this account; G or M address, repeatable")
 	sf.register(cmd, stream.DefaultTransactionPageLimit)
+	cmd.Flags().BoolVar(&detectConflicts, "detect-conflicts", false,
+		"annotate Soroban transactions with same-ledger read/write footprint conflicts")
 	registerFlagCompletion(cmd, "status", stream.TxStatusSuccess, stream.TxStatusFailed)
 	registerFlagCompletion(cmd, "gap-strategy", string(stream.GapFail), string(stream.GapResume))
 

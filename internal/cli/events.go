@@ -41,6 +41,7 @@ type streamFlags struct {
 	maxGapRecoveries int
 	quiet            bool
 	verbosity        int
+	process          func([]stream.Record) ([]stream.Record, error)
 	filter           stream.RecordFilter
 
 	output         string
@@ -730,6 +731,7 @@ func runStream(
 	if err != nil {
 		return err
 	}
+	opts.Process = sf.process
 	// --since is an explicit position like --from, so it is resolved here and
 	// overrides whatever the caller passed.
 	since, err := sf.resolveSince(cmd, client, stderr)

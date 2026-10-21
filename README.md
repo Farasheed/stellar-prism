@@ -268,6 +268,37 @@ $ prism ledgers --follow --compact
 2026-08-04T14:35:53Z  ledger 3966820  e68b8…0c1e
 ```
 
+### `prism operations` - stream transaction operations
+
+Deconstructs transaction envelopes into independently filterable records with
+stable ledger/transaction/operation IDs:
+
+```sh
+prism operations --type payment --type invoke_host_function --follow --json
+prism operations --source-account G... --from 3966000
+```
+
+### `prism transactions --detect-conflicts` - find footprint contention
+
+Annotates Soroban transactions when read/write footprint keys overlap within a
+ledger. Human output prints warnings; `--json` adds structured `conflicts`
+metadata:
+
+```sh
+prism transactions --detect-conflicts --follow
+prism transactions --detect-conflicts --follow --json
+```
+
+### `prism simulate` - follow a transaction simulation
+
+Re-simulates a base64 transaction envelope as the chain head advances and
+reports changes to return values, instructions, memory bytes, and minimum
+resource fees:
+
+```sh
+prism simulate --tx-envelope AAA... --follow --json
+```
+
 ## What prism guarantees
 
 This is a streaming tool, so the guarantee matters more than the feature list:

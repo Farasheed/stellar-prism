@@ -265,6 +265,13 @@ func (p *Pool) GetTransactions(ctx context.Context, req protocol.GetTransactions
 	})
 }
 
+// SimulateTransaction implements rpc.Client.
+func (p *Pool) SimulateTransaction(ctx context.Context, req protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
+	return poolCall(p, ctx, "simulateTransaction", func(c rpc.Client) (protocol.SimulateTransactionResponse, error) {
+		return c.SimulateTransaction(ctx, req)
+	})
+}
+
 // GetLatestLedger implements rpc.Client.
 func (p *Pool) GetLatestLedger(ctx context.Context) (protocol.GetLatestLedgerResponse, error) {
 	return poolCall(p, ctx, "getLatestLedger", func(c rpc.Client) (protocol.GetLatestLedgerResponse, error) {

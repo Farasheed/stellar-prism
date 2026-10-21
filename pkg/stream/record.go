@@ -27,6 +27,10 @@ const (
 	// KindWASMDeployment is a WASM upload or contract creation derived from a
 	// transaction envelope.
 	KindWASMDeployment Kind = "wasm_deployment"
+	// KindOperation is one operation extracted from a transaction envelope.
+	KindOperation Kind = "operation"
+	// KindSimulation is a simulation estimate for a template transaction.
+	KindSimulation Kind = "simulation"
 )
 
 // Record is one item in a stream, whatever its source.
@@ -56,6 +60,10 @@ type Record struct {
 	StorageChange *StorageChange
 	// WASMDeployment is set when Kind is KindWASMDeployment.
 	WASMDeployment *WASMEvent
+	// Operation is set when Kind is KindOperation.
+	Operation *Operation
+	// Simulation is set when Kind is KindSimulation.
+	Simulation *Simulation
 }
 
 // Event is a Soroban event as delivered by RPC. The XDR fields are kept in
@@ -71,6 +79,8 @@ type Event struct {
 	// TxIndex and OpIndex locate the event within its ledger.
 	TxIndex uint32
 	OpIndex uint32
+	// EventIndex locates the event within an operation.
+	EventIndex uint32
 	// TopicXDR holds the base64 ScVal topics, in order.
 	TopicXDR []string
 	// ValueXDR is the base64 ScVal payload.
@@ -115,6 +125,8 @@ type Transaction struct {
 	ResultXDR string
 	// ResultMetaXDR is the base64 TransactionMeta.
 	ResultMetaXDR string
+	// Conflicts contains Soroban footprint collisions detected in this ledger.
+	Conflicts []FootprintConflict
 
 	// Status is "success" or "failed" once the transaction has been
 	// classified. It is empty on a record produced without
@@ -181,4 +193,46 @@ type WASMEvent struct {
 	OpIndex uint32
 	// Successful indicates whether the transaction succeeded.
 	Successful bool
+}
+
+// Operation is one operation extracted from a transaction envelope.
+type Operation struct {
+	Index           uint32
+	TxIndex         uint32
+	Type            string
+	SourceAccount   string
+	ParametersXDR   string
+	ResultCode      string
+	ResultXDR       string
+	TransactionHash string
+}
+
+// FootprintConflict describes a ledger key accessed by multiple transactions
+// where at least one access is read-write.
+type FootprintConflict struct {
+	KeyXDR       string
+	ContractID   string
+	Transactions []string
+}
+
+// Simulation is the resource estimate returned by simulateTransaction.
+type Simulation struct {
+	Ledger         uint32
+	Error          string
+	ReturnValueXDR string
+	Instructions   uint32
+	DiskReadBytes  uint32
+	WriteBytes     uint32
+	MinResourceFee int64
+	Changed        []string
+	Previous       *SimulationSnapshot
+}
+
+// SimulationSnapshot contains the comparable values from the previous head.
+type SimulationSnapshot struct {
+	ReturnValueXDR string
+	Instructions   uint32
+	DiskReadBytes  uint32
+	WriteBytes     uint32
+	MinResourceFee int64
 }

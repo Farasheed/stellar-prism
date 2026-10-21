@@ -623,6 +623,10 @@ func (streamOnlyClient) GetTransactions(context.Context, protocol.GetTransaction
 	return protocol.GetTransactionsResponse{}, nil
 }
 
+func (streamOnlyClient) SimulateTransaction(context.Context, protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
+	return protocol.SimulateTransactionResponse{}, nil
+}
+
 func (streamOnlyClient) GetLatestLedger(context.Context) (protocol.GetLatestLedgerResponse, error) {
 	return protocol.GetLatestLedgerResponse{}, nil
 }
