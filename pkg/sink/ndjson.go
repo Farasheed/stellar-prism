@@ -73,35 +73,38 @@ type eventLine struct {
 
 // ledgerLine is the documented NDJSON shape for a ledger close.
 type ledgerLine struct {
-	Kind        string          `json:"kind"`
-	ID          string          `json:"id"`
-	Ledger      uint32          `json:"ledger"`
-	Time        string          `json:"time,omitempty"`
-	Hash        string          `json:"hash,omitempty"`
-	Metadata    json.RawMessage `json:"metadata,omitempty"`
-	MetadataXDR string          `json:"metadataXdr,omitempty"`
-	HeaderXDR   string          `json:"headerXdr,omitempty"`
+	Consensus   *stream.ConsensusMetrics `json:"consensus,omitempty"`
+	Kind        string                   `json:"kind"`
+	ID          string                   `json:"id"`
+	Ledger      uint32                   `json:"ledger"`
+	Time        string                   `json:"time,omitempty"`
+	Hash        string                   `json:"hash,omitempty"`
+	Metadata    json.RawMessage          `json:"metadata,omitempty"`
+	MetadataXDR string                   `json:"metadataXdr,omitempty"`
+	HeaderXDR   string                   `json:"headerXdr,omitempty"`
 }
 
 // transactionLine is the documented NDJSON shape for a transaction.
 type transactionLine struct {
-	Kind          string          `json:"kind"`
-	ID            string          `json:"id"`
-	Ledger        uint32          `json:"ledger"`
-	Time          string          `json:"time,omitempty"`
-	Hash          string          `json:"hash,omitempty"`
-	Index         uint32          `json:"index"`
-	Successful    bool            `json:"successful"`
-	Status        string          `json:"status,omitempty"`
-	FeeAccount    string          `json:"feeAccount,omitempty"`
-	FeeBump       *feeBumpLine    `json:"feeBump,omitempty"`
-	Failure       *failureLine    `json:"failure,omitempty"`
-	Envelope      json.RawMessage `json:"envelope,omitempty"`
-	Result        json.RawMessage `json:"result,omitempty"`
-	ResultMeta    json.RawMessage `json:"resultMeta,omitempty"`
-	EnvelopeXDR   string          `json:"envelopeXdr,omitempty"`
-	ResultXDR     string          `json:"resultXdr,omitempty"`
-	ResultMetaXDR string          `json:"resultMetaXdr,omitempty"`
+	Memo          *stream.SanitizedMemo `json:"memo,omitempty"`
+	MemoError     string                `json:"memoError,omitempty"`
+	Kind          string                `json:"kind"`
+	ID            string                `json:"id"`
+	Ledger        uint32                `json:"ledger"`
+	Time          string                `json:"time,omitempty"`
+	Hash          string                `json:"hash,omitempty"`
+	Index         uint32                `json:"index"`
+	Successful    bool                  `json:"successful"`
+	Status        string                `json:"status,omitempty"`
+	FeeAccount    string                `json:"feeAccount,omitempty"`
+	FeeBump       *feeBumpLine          `json:"feeBump,omitempty"`
+	Failure       *failureLine          `json:"failure,omitempty"`
+	Envelope      json.RawMessage       `json:"envelope,omitempty"`
+	Result        json.RawMessage       `json:"result,omitempty"`
+	ResultMeta    json.RawMessage       `json:"resultMeta,omitempty"`
+	EnvelopeXDR   string                `json:"envelopeXdr,omitempty"`
+	ResultXDR     string                `json:"resultXdr,omitempty"`
+	ResultMetaXDR string                `json:"resultMetaXdr,omitempty"`
 }
 
 // failureLine is the documented NDJSON shape for a decoded failure.
@@ -248,6 +251,7 @@ func (n *NDJSON) encode(r stream.Record) error {
 		}
 		if r.Close != nil {
 			line.Hash = r.Close.Hash
+			line.Consensus = r.Close.Consensus
 			if n.decode && r.Close.MetadataXDR != "" {
 				raw, err := n.decodeXDR(r.Close.MetadataXDR)
 				if err != nil {
@@ -270,6 +274,13 @@ func (n *NDJSON) encode(r stream.Record) error {
 		}
 		if r.Transaction != nil {
 			line.Hash = r.Transaction.Hash
+			memo, memoErr := stream.DecodeMemo(r.Transaction.EnvelopeXDR)
+			if memoErr == nil {
+				line.Memo = &memo
+			} else {
+				line.Memo = r.Transaction.Memo
+				line.MemoError = r.Transaction.MemoError
+			}
 			line.Index = r.Transaction.Index
 			line.Successful = r.Transaction.Successful
 			line.Status = r.Transaction.Status
@@ -452,6 +463,7 @@ func (n *NDJSON) decodeXDR(payload string) (json.RawMessage, error) {
 		return fallback, nil
 	}
 
+	sanitizeJSONMemoNodes(value.Node, false)
 	var buf bytes.Buffer
 	if err := n.lensFmt.Format(&buf, value); err != nil {
 		return nil, fmt.Errorf("ndjson: formatting decoded payload: %w", err)
@@ -472,4 +484,20 @@ func formatTime(t time.Time) string {
 		return ""
 	}
 	return t.UTC().Format(time.RFC3339)
+}
+
+// Preserve the lens envelope while sanitizing its decoded memo fields too.
+func sanitizeJSONMemoNodes(n *lens.Node, inMemo bool) {
+	if n == nil {
+		return
+	}
+	inMemo = inMemo || n.TypeName == "Memo"
+	if inMemo {
+		if s, ok := n.Value.(string); ok {
+			n.Value = stream.SanitizeText(s)
+		}
+	}
+	for _, child := range n.Children {
+		sanitizeJSONMemoNodes(child, inMemo)
+	}
 }

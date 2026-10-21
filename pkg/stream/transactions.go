@@ -19,6 +19,8 @@ const DefaultTransactionPageLimit = 100
 
 // TransactionQuery describes which transactions to stream.
 type TransactionQuery struct {
+	// Memo matches a prefix of the sanitized text memo; empty disables filtering.
+	Memo string
 	// StartLedger is where a fresh stream begins. Zero means start from the
 	// server's newest ledger.
 	StartLedger uint32
@@ -119,6 +121,9 @@ func (s *TransactionSource) Fetch(ctx context.Context, cursor string) (Batch, er
 				return Batch{}, fmt.Errorf("transaction source: %w", err)
 			}
 		}
+		if s.query.Memo != "" && (record.Transaction.Memo == nil || record.Transaction.Memo.Type != "text" || !strings.HasPrefix(record.Transaction.Memo.Value, s.query.Memo)) {
+			continue
+		}
 		batch.Records = append(batch.Records, record)
 	}
 	return batch, nil
@@ -126,7 +131,7 @@ func (s *TransactionSource) Fetch(ctx context.Context, cursor string) (Batch, er
 
 // transactionRecord converts an RPC transaction into a neutral Record.
 func transactionRecord(tx protocol.TransactionInfo) Record {
-	return Record{
+	r := Record{
 		ID:       fmt.Sprintf("%010d-%04d", tx.Ledger, tx.ApplicationOrder),
 		Sequence: tx.Ledger,
 		Time:     time.Unix(tx.LedgerCloseTime, 0).UTC(),
@@ -140,4 +145,10 @@ func transactionRecord(tx protocol.TransactionInfo) Record {
 			ResultMetaXDR: tx.ResultMetaXDR,
 		},
 	}
+	if memo, err := DecodeMemo(tx.EnvelopeXDR); err == nil {
+		r.Transaction.Memo = &memo
+	} else {
+		r.Transaction.MemoError = err.Error()
+	}
+	return r
 }

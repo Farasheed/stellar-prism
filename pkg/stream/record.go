@@ -79,6 +79,8 @@ type Event struct {
 
 // LedgerClose is ledger close metadata as delivered by RPC.
 type LedgerClose struct {
+	// Consensus is populated when consensus diagnostics are requested.
+	Consensus *ConsensusMetrics
 	// Hash is the hex ledger hash.
 	Hash string
 	// HeaderXDR is the base64 LedgerHeaderHistoryEntry.
@@ -89,6 +91,10 @@ type LedgerClose struct {
 
 // Transaction is a transaction as delivered by RPC.
 type Transaction struct {
+	// Memo is decoded and sanitized when the envelope is valid.
+	Memo *SanitizedMemo
+	// MemoError describes a malformed envelope without aborting the stream.
+	MemoError string
 	// Hash is the hex transaction hash.
 	Hash string
 	// Index is the zero-based index of the transaction within its ledger.
