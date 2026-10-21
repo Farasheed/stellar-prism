@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -84,6 +85,9 @@ func TestTransactionMemoCLI(t *testing.T) {
 		}
 		transactions = append(transactions, protocol.TransactionInfo{TransactionDetails: protocol.TransactionDetails{Ledger: 100, ApplicationOrder: int32(i + 1), EnvelopeXDR: encoded}})
 	}
+	transactions[0].Status = protocol.TransactionStatusSuccess
+	transactions[1].Status = protocol.TransactionStatusSuccess
+	transactions[2].Status = protocol.TransactionStatusFailed
 	withFake(t, fakerpc.NewTransactionServer(transactions))
 	stdout, _, err := run(t, "transactions", "--from", "100", "--memo", "invoice:", "--json", "--raw")
 	if err != nil {
@@ -91,5 +95,47 @@ func TestTransactionMemoCLI(t *testing.T) {
 	}
 	if strings.Count(stdout, `"kind":"transaction"`) != 2 || !strings.Contains(stdout, `"value":"invoice:é"`) || strings.Contains(stdout, `"value":"skip"`) {
 		t.Fatal(stdout)
+	}
+}
+
+func TestTransactionMemoCombinesWithStatusAndCursorState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cursor.jsonl")
+	var transactions []protocol.TransactionInfo
+	for i, text := range []string{"invoice:paid", "other", "invoice:failed"} {
+		var e xdr.TransactionEnvelope
+		if err := xdr.SafeUnmarshalBase64(cliUploadEnvelope(t, []byte{0, 97, 115, 109}), &e); err != nil {
+			t.Fatal(err)
+		}
+		e.V1.Tx.Memo = xdr.MemoText(text)
+		encoded, err := xdr.MarshalBase64(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		status := protocol.TransactionStatusSuccess
+		if i == 2 {
+			status = protocol.TransactionStatusFailed
+		}
+		transactions = append(transactions, protocol.TransactionInfo{TransactionDetails: protocol.TransactionDetails{Ledger: 100, ApplicationOrder: int32(i + 1), EnvelopeXDR: encoded, Status: status}})
+	}
+	withFake(t, fakerpc.NewTransactionServer(transactions))
+	for _, prefix := range []string{"invoice:", "other"} {
+		stdout, _, err := run(t, "transactions", "--from", "100", "--memo", prefix, "--status", "success", "--json", "--raw", "--state-file", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Count(stdout, `"kind":"transaction"`) != 1 || strings.Contains(stdout, "invoice:failed") {
+			t.Fatal(stdout)
+		}
+		key := stateKey("transactions", "status=success", "memo="+prefix)
+		if entries := stateEntries(t, path, key); len(entries) == 0 {
+			t.Fatalf("no cursor for %s", key)
+		}
+	}
+	// Existing unfiltered checkpoints retain their original state key.
+	if _, _, err := run(t, "transactions", "--from", "100", "--json", "--raw", "--state-file", path); err != nil {
+		t.Fatal(err)
+	}
+	if entries := stateEntries(t, path, "transactions"); len(entries) == 0 {
+		t.Fatal("default cursor key changed")
 	}
 }

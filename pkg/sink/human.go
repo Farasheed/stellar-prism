@@ -204,6 +204,12 @@ func (h *Human) emitTransaction(r stream.Record) error {
 	if !t.Successful {
 		fmt.Fprintf(&b, "  %sfailed%s", p.Remove, p.Reset)
 	}
+	if t.Failure.Trapped() {
+		fmt.Fprintf(&b, "  %strapped%s", p.Remove, p.Reset)
+	}
+	if t.FeeBump != nil {
+		fmt.Fprintf(&b, "  %sfee-bump by %s%s", p.Dim, shorten(t.FeeBump.FeeAccount), p.Reset)
+	}
 	b.WriteString("\n")
 
 	if _, err := h.w.WriteString(b.String()); err != nil {
@@ -222,6 +228,17 @@ func (h *Human) emitTransaction(r stream.Record) error {
 		return nil
 	}
 
+	if t.Failure != nil {
+		if err := h.emitFailure(t.Failure); err != nil {
+			return err
+		}
+	}
+	if t.FeeBump != nil {
+		if err := h.emitFeeBump(t.FeeBump); err != nil {
+			return err
+		}
+	}
+
 	if t.EnvelopeXDR != "" {
 		if err := h.writePayload("envelope", t.EnvelopeXDR); err != nil {
 			return err
@@ -235,6 +252,74 @@ func (h *Human) emitTransaction(r stream.Record) error {
 	if t.ResultMetaXDR != "" {
 		if err := h.writePayload("meta", t.ResultMetaXDR); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// emitFailure renders the decoded reason(s) for a failed transaction, naming
+// the most specific level available: failing operation, fee-bump inner
+// transaction, then the transaction-level code.
+func (h *Human) emitFailure(f *stream.Failure) error {
+	p := h.palette
+
+	if f.Operation != nil {
+		label := f.Operation.Type
+		if label == "" {
+			label = "operation"
+		}
+		if _, err := fmt.Fprintf(h.w, "  %sfailed operation %d (%s): %s: %s%s\n",
+			p.Key, f.Operation.Index, label, f.Operation.Detail.Code,
+			f.Operation.Detail.Summary, p.Reset); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
+		if f.Operation.Detail.Hint != "" {
+			if _, err := fmt.Fprintf(h.w, "  %shint: %s%s\n",
+				p.Dim, f.Operation.Detail.Hint, p.Reset); err != nil {
+				return fmt.Errorf("human: write: %w", err)
+			}
+		}
+		if f.Operation.Trapped {
+			if _, err := fmt.Fprintf(h.w, "  %scontract execution trapped or panicked%s\n",
+				p.Remove, p.Reset); err != nil {
+				return fmt.Errorf("human: write: %w", err)
+			}
+		}
+	} else if f.Inner != nil {
+		if _, err := fmt.Fprintf(h.w, "  %sinner reason: %s: %s%s\n",
+			p.Key, f.Inner.Code, f.Inner.Summary, p.Reset); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
+	} else {
+		if _, err := fmt.Fprintf(h.w, "  %sreason: %s: %s%s\n",
+			p.Key, f.Detail.Code, f.Detail.Summary, p.Reset); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
+	}
+
+	if f.Detail.Hint != "" && f.Operation == nil && f.Inner == nil {
+		if _, err := fmt.Fprintf(h.w, "  %shint: %s%s\n", p.Dim, f.Detail.Hint, p.Reset); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
+	}
+	return nil
+}
+
+// emitFeeBump renders the wrapper and inner transaction details side by side,
+// so the effective payer is never confused with the transaction's author.
+func (h *Human) emitFeeBump(info *stream.FeeBump) error {
+	p := h.palette
+	if _, err := fmt.Fprintf(h.w, "  %sfee account %s, inner source %s%s\n",
+		p.Key, info.FeeAccount, info.InnerSource, p.Reset); err != nil {
+		return fmt.Errorf("human: write: %w", err)
+	}
+	if _, err := fmt.Fprintf(h.w, "  %sfees: max %d stroops, inner %d, charged %d%s\n",
+		p.Dim, info.MaxFee, info.InnerFee, info.FeeCharged, p.Reset); err != nil {
+		return fmt.Errorf("human: write: %w", err)
+	}
+	if info.InnerHash != "" {
+		if _, err := fmt.Fprintf(h.w, "  %sinner tx %s%s\n", p.Dim, info.InnerHash, p.Reset); err != nil {
+			return fmt.Errorf("human: write: %w", err)
 		}
 	}
 	return nil

@@ -60,7 +60,9 @@ returns — there is no polling loop, no cursor advancement, no reconnection, an
 | **Follow as ledgers close** | ❌ | ✅ |
 | **Cursor continuity across polls** | ❌ | ✅ |
 | **Reconnect with backoff** | ❌ | ✅ |
+| **Adaptive poll rate** | ❌ | ✅ (`--adaptive`) |
 | **NDJSON for pipelines** | ❌ | ✅ |
+| **Per-contract fan-out** | ❌ | ✅ (`--fanout-dir`) |
 | **Gap detection** | ❌ | ✅ |
 | Ledger streaming | ❌ | ✅ |
 | Contract-spec-decoded payloads | ✅ **better** | ❌ ([roadmap](docs/roadmap.md)) |
@@ -85,6 +87,9 @@ prism events --contract CDLZF...CYSC --follow
 # Backfill from a ledger, then keep following
 prism events --contract CDLZF...CYSC --from 3966000 --follow
 
+# Start about ten minutes back, without picking a ledger
+prism events --contract CDLZF...CYSC --since 10m --follow
+
 # Filter by topic, using the server's wildcard syntax
 prism events --topic 'AAAADwAAAANmZWUA,*' --limit 20
 ```
@@ -92,6 +97,32 @@ prism events --topic 'AAAADwAAAANmZWUA,*' --limit 20
 Topic filters are evaluated by the RPC server with the same semantics as
 `stellar events --topic`: `*` matches exactly one segment, `**` matches zero or
 more and must come last.
+
+`--since` converts a relative window into an approximate start ledger (ledgers
+close roughly every 5s; the window rounds up, so it never starts late). For
+topics, `--topic-pattern` matches their **decoded** text rather than base64
+XDR, with glob, prefix and regex segments:
+
+```sh
+# Any topic whose first segment starts with "transfer" (e.g. a symbol)
+prism events --topic-pattern 'prefix:transfer' --limit 20
+
+# Regex over the decoded topic text
+prism events --contract CBGSB... --topic-pattern 're:burn.*' --follow
+
+# Watch several contracts and split them into per-contract NDJSON files
+prism events --contract CDLZF... --contract CDLZA... --fanout-dir events/ --follow
+
+# Let the follow loop tune its own poll rate from observed ledger closes
+prism events --contract CDLZF... --follow --adaptive
+```
+
+`--fanout-dir` writes one NDJSON file per watched contract under the
+directory (streamed through a per-contract demux with bounded queues), while
+the terminal keeps the combined stream. `--adaptive` replaces the fixed
+`--poll` wait with a tuner whose only signal is how many ledgers closed
+during the last wait, so it tracks the network's own cadence between 1s and
+30s, jittered so several instances do not poll in phase.
 
 ### Batched output and parallel backfill
 
@@ -135,8 +166,75 @@ $ prism events --limit 4 --json | jq -r '"\(.ledger)  \(.contract[0:8])…  \(.v
 3966820  CDLZFC3S…  ScValTypeScvI128
 ```
 
-### `prism tx` — why did this transaction fail?
+### Resuming a stream from where it stopped
 
+`--state-file` records the position the stream reached after every page, so
+the next run can pick the stream up where the last one stopped:
+
+```sh
+# Record the position as the stream runs
+prism events --contract CDLZF... --follow --state-file ~/.cache/prism/events.jsonl
+
+# Continue from the last recorded position
+prism events --contract CDLZF... --follow \
+  --state-file ~/.cache/prism/events.jsonl --resume
+```
+
+The file is a journal: one checkpoint per delivered page. A background pruner
+compacts it while the stream runs, so it stays small however long you follow.
+`--prune-keep` sets how many checkpoints to keep (100 by default),
+`--prune-max-age` drops the ones that are too old, and `--prune-interval` sets
+how often the compaction happens.
+
+A checkpoint is written only after a page has been delivered *in full*, so a
+recorded position never points past records the run did not emit. The same
+holds for a concurrent backfill (`--backfill-workers`): the drain reports the
+position it reached, and a page the `--limit` cut short is not reported at all.
+
+This narrows the restart window from "the whole run" to "one record". It is
+not exactly-once — see [What prism guarantees](#what-prism-guarantees).
+
+### `prism transactions` — successes, failures, traps and fee bumps
+
+Every transaction is classified as it streams: `status`, the account that
+actually paid the fee, and — for a fee-bump wrapper — the wrapper and inner
+transaction details side by side. Failed transactions carry a decoded reason
+naming the failing operation.
+
+```sh
+# Only failures, with the decoded reason
+prism transactions --status failed --follow
+
+# Soroban contract executions that trapped or panicked
+prism transactions --trapped --json | jq -r '.failure.operation.summary'
+
+# Fee-bump wrappers, and who paid for them
+prism transactions --fee-bump --json | jq -r '.feeAccount'
+
+# Everything a particular account paid the fee for
+prism transactions --fee-account GBGSB... --follow
+```
+
+`--trapped` is narrower than `--status failed`: it selects only host
+functions that trapped or panicked, not malformed invocations or exceeded
+resource limits. `--fee-account` accepts a G or M address and matches the
+effective payer, so a muxed fee source resolves to its underlying account.
+
+The filters are applied after each page is fetched, so the cursor still
+advances across suppressed transactions — a filtered stream is a view of the
+transaction stream rather than a second stream that could skip history.
+
+```console
+$ prism transactions --status failed --limit 1 --json
+{"kind":"transaction","id":"0003966820-0001","ledger":3966820,"hash":"…","index":1,"successful":false,"status":"failed","feeAccount":"GBGSB…","failure":{"code":"tx_failed","summary":"The transaction was well-formed and authorised, but at least one of its operations failed.","operation":{"index":0,"type":"invoke_host_function","code":"invoke_host_function_trapped","summary":"The contract trapped: it panicked, or explicitly returned an error."}}}
+```
+
+Event streams can additionally drop re-polled duplicates with
+`--dedup-window`: a bounded ring remembers the last N event fingerprints and
+suppresses a replay without growing with traffic. It is off by default; `4096`
+covers a page with margin.
+
+### `prism tx` — why did this transaction fail?
 Fetches a transaction and renders it through the lens explain path, pairing the
 envelope with its result so the failure is attributed to the operation that
 caused it:
@@ -192,8 +290,10 @@ This is a streaming tool, so the guarantee matters more than the feature list:
   printed on stderr.
 - **Not exactly-once across restarts.** prism cannot atomically emit a record
   and commit its cursor, so a process killed between the two re-emits on
-  restart. Key off `id` if that matters to you. Durable cursors are on the
-  [roadmap](docs/roadmap.md).
+  restart. `--state-file` records the position after every delivered page and
+  `--resume` starts the next run from it, which narrows that window to a
+  single record — but it is still not exactly-once. Key off `id` if that
+  matters to you.
 
 These are enforced by tests, not just claimed — see
 [docs/architecture.md](docs/architecture.md#testing-the-guarantee).
@@ -252,7 +352,8 @@ before v1.0.
   skipped range reported.
 - Payloads render as the XDR wire shape — prism has no contract-spec decoding,
   and `stellar events` is better for that today.
-- No durable cursor yet, so exactly-once across restarts is not offered.
+- Optional cursor journal (`--state-file`) with background pruning, and
+  `--resume` to continue from it. Still not exactly-once across restarts.
 
 See [docs/roadmap.md](docs/roadmap.md).
 
