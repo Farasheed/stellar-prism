@@ -17,6 +17,8 @@ const DefaultPollInterval = 5 * time.Second
 type Stats struct {
 	// Emitted counts records handed to the Sink.
 	Emitted int
+	// Filtered counts records rejected by a configured client-side filter.
+	Filtered int
 	// Duplicates counts records the server re-sent that were suppressed.
 	// A non-zero value after a reconnect is expected and healthy.
 	Duplicates int
@@ -55,6 +57,9 @@ type Options struct {
 	Follow bool
 	// Limit stops the stream after this many records. Zero means unlimited.
 	Limit int
+	// Filter runs before the sink. Rejected records still advance the source
+	// cursor, but do not count toward Limit or Emitted.
+	Filter RecordFilter
 	// PollInterval is the wait between polls once caught up.
 	PollInterval time.Duration
 	// Backoff governs retry delays after a failed fetch.
@@ -400,6 +405,17 @@ func (t *Tailer) emit(b Batch) (done bool, emitted int, err error) {
 		if t.lastID != "" && r.ID <= t.lastID {
 			t.stats.Duplicates++
 			continue
+		}
+		if t.opts.Filter != nil {
+			matched, err := t.opts.Filter.Match(r)
+			if err != nil {
+				return false, emitted, fmt.Errorf("filtering record %s: %w", r.ID, err)
+			}
+			if !matched {
+				t.lastID = r.ID
+				t.stats.Filtered++
+				continue
+			}
 		}
 
 		if err := t.sink.Emit(r); err != nil {

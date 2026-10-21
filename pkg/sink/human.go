@@ -108,6 +108,12 @@ func (h *Human) emitEvent(r stream.Record) error {
 	}
 
 	var b strings.Builder
+	indent := ""
+	if e.CallDepth > 0 {
+		indent = strings.Repeat("   ", e.CallDepth-1)
+		fmt.Fprintf(&b, "%s└─ [call %d] ", indent, e.CallDepth)
+		indent += "   "
+	}
 	fmt.Fprintf(&b, "%s%s%s  %sledger %d%s  %s%s%s",
 		p.Note, formatTime(r.Time), p.Reset,
 		p.Dim, r.Sequence, p.Reset,
@@ -115,6 +121,9 @@ func (h *Human) emitEvent(r stream.Record) error {
 	)
 	if e.ContractID != "" {
 		fmt.Fprintf(&b, "  %s%s%s", p.Key, shorten(e.ContractID), p.Reset)
+	}
+	if e.ParentContractID != "" {
+		fmt.Fprintf(&b, "  %sfrom %s%s", p.Dim, shorten(e.ParentContractID), p.Reset)
 	}
 	if e.TxHash != "" {
 		fmt.Fprintf(&b, "  %stx %s%s", p.Dim, shorten(e.TxHash), p.Reset)
@@ -129,12 +138,12 @@ func (h *Human) emitEvent(r stream.Record) error {
 	}
 
 	for i, t := range e.TopicXDR {
-		if err := h.writePayload(fmt.Sprintf("topic[%d]", i), t); err != nil {
+		if err := h.writePayload(fmt.Sprintf("%stopic[%d]", indent, i), t); err != nil {
 			return err
 		}
 	}
 	if e.ValueXDR != "" {
-		if err := h.writePayload("value", e.ValueXDR); err != nil {
+		if err := h.writePayload(indent+"value", e.ValueXDR); err != nil {
 			return err
 		}
 	}
