@@ -13,7 +13,7 @@ func newFeeStatsCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 		Long:    "Stream base fee, base reserve, fee pool, circulating coins, and transaction fee averages for each ledger close.",
 		Example: "  prism fee-stats --follow\n  prism fee-stats --from 1234567 --json",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := sf.validate(); err != nil {
+			if err := sf.validate(cmd); err != nil {
 				return err
 			}
 			client, closeClient, err := openClient(g, stderr)
@@ -21,17 +21,10 @@ func newFeeStatsCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 				return err
 			}
 			defer closeClient()
-			from := sf.from
-			if from == 0 {
-				from, err = latestLedger(cmd.Context(), client)
-				if err != nil {
-					return err
-				}
-			}
 			factory := func(start uint32) (stream.Source, error) {
 				return stream.NewFeeStatsSource(client, stream.LedgerQuery{StartLedger: start, PageLimit: sf.pageSize})
 			}
-			return runStream(cmd.Context(), factory, from, &sf, g, stdout, stderr)
+			return runStream(cmd, client, factory, sf.from, &sf, g, stdout, stderr)
 		},
 	}
 	sf.register(cmd, stream.DefaultLedgerPageLimit)

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 
 	"github.com/stellar-optics/stellar-xdr-lens/pkg/lens"
@@ -189,6 +190,27 @@ func (h *Human) emitLedger(r stream.Record) error {
 	if _, err := h.w.WriteString(b.String()); err != nil {
 		return fmt.Errorf("human: write: %w", err)
 	}
+	if c.Consensus != nil {
+		m := c.Consensus
+		if _, err := fmt.Fprintf(h.w, "  consensus: signers=%v signature=%t quorum-data=%t\n", m.ValueSigners, m.SignaturePresent, m.QuorumDataAvailable); err != nil {
+			return err
+		}
+		if m.CloseDeltaSeconds != nil {
+			if _, err := fmt.Fprintf(h.w, "  close delta: %ds\n", *m.CloseDeltaSeconds); err != nil {
+				return err
+			}
+		}
+		for _, warning := range m.Warnings {
+			if _, err := fmt.Fprintf(h.w, "  warning: %s\n", stream.SanitizeText(warning)); err != nil {
+				return err
+			}
+		}
+		if m.Error != "" {
+			if _, err := fmt.Fprintf(h.w, "  consensus error: %s\n", stream.SanitizeText(m.Error)); err != nil {
+				return err
+			}
+		}
+	}
 	if h.compact || c.MetadataXDR == "" {
 		return nil
 	}
@@ -222,13 +244,39 @@ func (h *Human) emitTransaction(r stream.Record) error {
 			fmt.Fprintf(&b, ": %s", t.FailureReason)
 		}
 	}
+	if t.Failure.Trapped() {
+		fmt.Fprintf(&b, "  %strapped%s", p.Remove, p.Reset)
+	}
+	if t.FeeBump != nil {
+		fmt.Fprintf(&b, "  %sfee-bump by %s%s", p.Dim, shorten(t.FeeBump.FeeAccount), p.Reset)
+	}
 	b.WriteString("\n")
 
 	if _, err := h.w.WriteString(b.String()); err != nil {
 		return fmt.Errorf("human: write: %w", err)
 	}
+	memo, memoErr := stream.DecodeMemo(t.EnvelopeXDR)
+	if memoErr != nil && t.Memo != nil {
+		memo = *t.Memo
+	}
+	if memo.Type != "" {
+		if _, err := fmt.Fprintf(h.w, "  memo %s: %s\n", memo.Type, stream.HumanMemo(memo)); err != nil {
+			return err
+		}
+	}
 	if h.compact {
 		return nil
+	}
+
+	if t.Failure != nil {
+		if err := h.emitFailure(t.Failure); err != nil {
+			return err
+		}
+	}
+	if t.FeeBump != nil {
+		if err := h.emitFeeBump(t.FeeBump); err != nil {
+			return err
+		}
 	}
 
 	if t.EnvelopeXDR != "" {
@@ -244,6 +292,74 @@ func (h *Human) emitTransaction(r stream.Record) error {
 	if t.ResultMetaXDR != "" {
 		if err := h.writePayload("meta", t.ResultMetaXDR); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// emitFailure renders the decoded reason(s) for a failed transaction, naming
+// the most specific level available: failing operation, fee-bump inner
+// transaction, then the transaction-level code.
+func (h *Human) emitFailure(f *stream.Failure) error {
+	p := h.palette
+
+	if f.Operation != nil {
+		label := f.Operation.Type
+		if label == "" {
+			label = "operation"
+		}
+		if _, err := fmt.Fprintf(h.w, "  %sfailed operation %d (%s): %s: %s%s\n",
+			p.Key, f.Operation.Index, label, f.Operation.Detail.Code,
+			f.Operation.Detail.Summary, p.Reset); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
+		if f.Operation.Detail.Hint != "" {
+			if _, err := fmt.Fprintf(h.w, "  %shint: %s%s\n",
+				p.Dim, f.Operation.Detail.Hint, p.Reset); err != nil {
+				return fmt.Errorf("human: write: %w", err)
+			}
+		}
+		if f.Operation.Trapped {
+			if _, err := fmt.Fprintf(h.w, "  %scontract execution trapped or panicked%s\n",
+				p.Remove, p.Reset); err != nil {
+				return fmt.Errorf("human: write: %w", err)
+			}
+		}
+	} else if f.Inner != nil {
+		if _, err := fmt.Fprintf(h.w, "  %sinner reason: %s: %s%s\n",
+			p.Key, f.Inner.Code, f.Inner.Summary, p.Reset); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
+	} else {
+		if _, err := fmt.Fprintf(h.w, "  %sreason: %s: %s%s\n",
+			p.Key, f.Detail.Code, f.Detail.Summary, p.Reset); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
+	}
+
+	if f.Detail.Hint != "" && f.Operation == nil && f.Inner == nil {
+		if _, err := fmt.Fprintf(h.w, "  %shint: %s%s\n", p.Dim, f.Detail.Hint, p.Reset); err != nil {
+			return fmt.Errorf("human: write: %w", err)
+		}
+	}
+	return nil
+}
+
+// emitFeeBump renders the wrapper and inner transaction details side by side,
+// so the effective payer is never confused with the transaction's author.
+func (h *Human) emitFeeBump(info *stream.FeeBump) error {
+	p := h.palette
+	if _, err := fmt.Fprintf(h.w, "  %sfee account %s, inner source %s%s\n",
+		p.Key, info.FeeAccount, info.InnerSource, p.Reset); err != nil {
+		return fmt.Errorf("human: write: %w", err)
+	}
+	if _, err := fmt.Fprintf(h.w, "  %sfees: max %d stroops, inner %d, charged %d%s\n",
+		p.Dim, info.MaxFee, info.InnerFee, info.FeeCharged, p.Reset); err != nil {
+		return fmt.Errorf("human: write: %w", err)
+	}
+	if info.InnerHash != "" {
+		if _, err := fmt.Fprintf(h.w, "  %sinner tx %s%s\n", p.Dim, info.InnerHash, p.Reset); err != nil {
+			return fmt.Errorf("human: write: %w", err)
 		}
 	}
 	return nil
@@ -374,6 +490,7 @@ func (h *Human) writePayload(label, payload string) error {
 		return nil
 	}
 
+	sanitizeHumanNode(value.Node)
 	var buf bytes.Buffer
 	if err := h.tree.Format(&buf, value); err != nil {
 		return fmt.Errorf("human: formatting payload: %w", err)
@@ -406,4 +523,31 @@ func shorten(s string) string {
 		return s
 	}
 	return s[:5] + "…" + s[len(s)-4:]
+}
+
+// Sanitize untrusted node values before the formatter adds its own trusted
+// terminal colors and tree glyphs.
+func sanitizeHumanNode(n *lens.Node) {
+	if n == nil {
+		return
+	}
+	terminalText := func(s string) string {
+		var b strings.Builder
+		for _, r := range stream.SanitizeText(s) {
+			if r > 126 {
+				q := strconv.QuoteRuneToASCII(r)
+				b.WriteString(q[1 : len(q)-1])
+			} else {
+				b.WriteRune(r)
+			}
+		}
+		return b.String()
+	}
+	if s, ok := n.Value.(string); ok {
+		n.Value = terminalText(s)
+	}
+	n.Note = terminalText(n.Note)
+	for _, child := range n.Children {
+		sanitizeHumanNode(child)
+	}
 }

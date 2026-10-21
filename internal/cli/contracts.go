@@ -1,9 +1,10 @@
 package cli
 
 import (
+	"io"
+
 	"github.com/spf13/cobra"
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
-	"io"
 )
 
 func newContractsCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
@@ -14,7 +15,7 @@ func newContractsCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 		Long:    "Watch contract storage changes, restoration and deployment activity, including TTL live-until ledgers and low-TTL warnings. TTL entries expose their ledger key hash, since RPC does not associate them with contract IDs in transaction metadata.",
 		Example: "  prism contracts --watch CDLZF... --follow\n  prism contracts --follow --watch CDLZF... --json",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := sf.validate(); err != nil {
+			if err := sf.validate(cmd); err != nil {
 				return err
 			}
 			client, closeClient, err := openClient(g, stderr)
@@ -22,17 +23,10 @@ func newContractsCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
 				return err
 			}
 			defer closeClient()
-			from := sf.from
-			if from == 0 {
-				from, err = latestLedger(cmd.Context(), client)
-				if err != nil {
-					return err
-				}
-			}
 			factory := func(start uint32) (stream.Source, error) {
 				return stream.NewContractLifecycleSource(client, stream.ContractLifecycleQuery{StartLedger: start, PageLimit: sf.pageSize, ContractIDs: watch, NetworkPassphrase: network})
 			}
-			return runStream(cmd.Context(), factory, from, &sf, g, stdout, stderr)
+			return runStream(cmd, client, factory, sf.from, &sf, g, stdout, stderr)
 		},
 	}
 	cmd.Flags().StringSliceVar(&watch, "watch", nil, "contract ID to watch; repeatable")
