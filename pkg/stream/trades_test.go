@@ -4,8 +4,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stellar-optics/stellar-prism/internal/fakerpc"
 	"github.com/stellar/go-stellar-sdk/xdr"
+
+	"github.com/stellar-optics/stellar-prism/internal/fakerpc"
 )
 
 func TestExtractPathPaymentTradeUsesExecutedAmounts(t *testing.T) {

@@ -5,9 +5,10 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/stellar-optics/stellar-prism/pkg/rpc"
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 	"github.com/stellar/go-stellar-sdk/xdr"
+
+	"github.com/stellar-optics/stellar-prism/pkg/rpc"
 )
 
 // FeeStatsSource streams one fee-market summary per closed ledger.

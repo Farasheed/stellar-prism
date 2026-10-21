@@ -4,6 +4,7 @@ import (
 	"io"
 
 	"github.com/spf13/cobra"
+
 	"github.com/stellar-optics/stellar-prism/pkg/stream"
 )
 

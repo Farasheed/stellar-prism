@@ -8,9 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/stellar-optics/stellar-prism/pkg/rpc"
 	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/xdr"
+
+	"github.com/stellar-optics/stellar-prism/pkg/rpc"
 )
 
 type TradeQuery struct {
@@ -157,9 +158,9 @@ func extractPathPaymentTrades(tx *Transaction, ledger uint32, closeTime time.Tim
 		default:
 			continue
 		}
-		in, _ := strconv.ParseFloat(trade.AmountIn, 64)
-		outAmount, _ := strconv.ParseFloat(trade.AmountOut, 64)
-		if in > 0 {
+		in, inErr := strconv.ParseFloat(trade.AmountIn, 64)
+		outAmount, outErr := strconv.ParseFloat(trade.AmountOut, 64)
+		if inErr == nil && outErr == nil && in > 0 {
 			trade.Price = strconv.FormatFloat(outAmount/in, 'f', 8, 64)
 		}
 		out = append(out, Record{ID: fmt.Sprintf("%010d-%06d-%06d", ledger, tx.Index, i), Sequence: ledger, Time: closeTime, Kind: KindTrade, Trade: trade})
@@ -205,7 +206,7 @@ func sorobanSwapTrade(event xdr.ContractEvent, hash string, index uint32) (*Trad
 		return nil, false
 	}
 	name, ok := scValName(topics[0])
-	if !ok || !(strings.EqualFold(name, "swap") || strings.EqualFold(name, "swapped")) {
+	if !ok || (!strings.EqualFold(name, "swap") && !strings.EqualFold(name, "swapped")) {
 		return nil, false
 	}
 	trader, ok := scValAddress(topics[1])
