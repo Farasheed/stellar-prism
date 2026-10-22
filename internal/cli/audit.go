@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -14,8 +15,8 @@ import (
 //
 // prism audit verification command validates NDJSON dump integrity:
 //
-//	 cat events.ndjson | prism audit
-//	 prism audit /data/events/2026-10-20.ndjson
+//	cat events.ndjson | prism audit
+//	prism audit /data/events/2026-10-20.ndjson
 //
 // Features:
 //   - Validates sequence continuity and identifies any ledger gaps
@@ -141,7 +142,7 @@ func auditLines(lines []string) *auditResult {
 	var lastID string
 	var seenIDs = make(map[string]int) // ID -> line number (1-indexed)
 	var anomalies []anomalyInfo
-	var ledgerMin uint32 = ^uint32(0) // max uint32
+	var ledgerMin = ^uint32(0) // max uint32
 	var ledgerMax uint32
 
 	for i, line := range lines {
@@ -223,10 +224,10 @@ type auditResult struct {
 
 // anomalyInfo describes a single anomaly found during auditing.
 type anomalyInfo struct {
-	Type      string
-	Line      int
-	Message   string
-	Severity  string
+	Type     string
+	Line     int
+	Message  string
+	Severity string
 }
 
 // recordInfo holds the parsed fields from an NDJSON record.
@@ -241,11 +242,11 @@ type recordInfo struct {
 func parseNDJSONLine(line string, record *recordInfo) error {
 	// Simple NDJSON parsing: find "id" and "ledger" fields
 	// In a real implementation, this would use proper JSON parsing
-	
+
 	record.ID = ""
 	record.Ledger = 0
 	record.Timestamp = 0
-	
+
 	// Try to find id field
 	idIdx := strings.Index(line, "\"id\"")
 	if idIdx >= 0 {
@@ -256,7 +257,7 @@ func parseNDJSONLine(line string, record *recordInfo) error {
 			record.ID = rest[:quoteIdx]
 		}
 	}
-	
+
 	// Try to find ledger field
 	ledgerIdx := strings.Index(line, "\"ledger\"")
 	if ledgerIdx >= 0 {
@@ -271,15 +272,17 @@ func parseNDJSONLine(line string, record *recordInfo) error {
 				// Simple parsing - find the full number
 				numEnd := strings.IndexAny(rest, ",\"")
 				if numEnd >= 0 {
-					var num int
-					fmt.Sscanf(rest[:numEnd], "%d", &num)
+					num, err := strconv.Atoi(rest[:numEnd])
+					if err != nil {
+						continue
+					}
 					record.Ledger = uint32(num)
 				}
 				break
 			}
 		}
 	}
-	
+
 	return nil
 }
 

@@ -98,10 +98,10 @@ type HealthBehaviour struct {
 // NewMockRPC returns a new empty MockRPC ready for scripting.
 func NewMockRPC() *MockRPC {
 	return &MockRPC{
-		script:       map[int]Behaviour{},
-		pageLimit:    100,
-		entries:      map[string]protocol.LedgerEntryResult{},
-		tx:           map[string]protocol.GetTransactionResponse{},
+		script:    map[int]Behaviour{},
+		pageLimit: 100,
+		entries:   map[string]protocol.LedgerEntryResult{},
+		tx:        map[string]protocol.GetTransactionResponse{},
 	}
 }
 

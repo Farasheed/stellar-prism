@@ -5,9 +5,9 @@ import (
 	"io"
 
 	"github.com/spf13/cobra"
-	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 	lens "github.com/stellar-optics/stellar-xdr-lens/pkg/lens"
 	lensformat "github.com/stellar-optics/stellar-xdr-lens/pkg/lens/format"
+	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 )
 
 // newDiffCmd implements the `prism diff` command.
